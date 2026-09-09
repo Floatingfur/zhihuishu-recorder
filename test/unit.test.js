@@ -84,5 +84,32 @@ const out = path.join(__dirname, 'out-test.docx');
 fs.writeFileSync(out, Buffer.from(docx));
 console.log('  ✓ 已写入 ' + out + '（' + docx.length + ' bytes，待 Expand-Archive 校验）');
 
+ok('去掉“第N题”题号', () => assert.strictEqual(Z.normalizeStem('第1题 以下哪项属于马克思主义？'), '以下哪项属于马克思主义？'));
+ok('去掉“第1题.”题号', () => assert.strictEqual(Z.normalizeStem('第12题. 二次函数定义'), '二次函数定义'));
+
+console.log('== coursesToDoc 跨章分组 ==');
+const grouped = Z.coursesToDoc({
+  name: '测试课',
+  questions: [
+    { stem: 'q1', chapter: '第一章' },
+    { stem: 'q2', chapter: '第二章' },
+    { stem: 'q3', chapter: '第一章' }
+  ]
+});
+ok('按章节分组且保序', () => {
+  assert.strictEqual(grouped.sections.length, 2);
+  assert.strictEqual(grouped.sections[0].name, '第一章');
+  assert.strictEqual(grouped.sections[0].questions.length, 2);
+  assert.strictEqual(grouped.sections[1].name, '第二章');
+});
+ok('全局去重入库可被 Word 正确分组', () => {
+  const m = Z.mergeQuestions([], [
+    { stem: '第1题 三要素？', type: 'single', options: [], answer: 'A', chapter: '第一章' },
+    { stem: '三要素？', type: 'single', options: [], answer: 'A', chapter: '第二章' }
+  ]);
+  assert.strictEqual(m.list.length, 1, '同题跨章应只存 1 条');
+  assert.strictEqual(Z.coursesToDoc({ name: 'x', questions: m.list }).sections[0].name, '第一章');
+});
+
 console.log(passed + ' 项通过');
 if (process.exitCode) { console.error('存在失败用例'); }

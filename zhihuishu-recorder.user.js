@@ -40,8 +40,8 @@ var ZHR = (function () {
   /* 题干规范化：去首部题号、折叠空白，用于去重键 */
   function normalizeStem(stem) {
     var s = normWs(stem);
-    s = s.replace(/^(第?\d+[.、．)）:：]?\s*)+/, '');
-    s = s.replace(/\s+/g, ' ').trim();
+    s = s.replace(/^第\s*[0-9一二三四五六七八九十百零]+\s*题[.、．)）:：]?\s*/, '');
+    s = s.replace(/^\d+[.、．)）:：]\s*/, '');
     return s;
   }
 
@@ -75,11 +75,10 @@ var ZHR = (function () {
 
   /* entries: [{name:String, data:Uint8Array}]，返回完整 zip 的 Uint8Array */
   function zipStore(entries) {
-    var enc = TextEncoder ? utf8 : null;
     var locals = [], centrals = [];
     var offset = 0, total = 0;
     entries.forEach(function (e) {
-      var nameB = enc(e.name);
+      var nameB = utf8(e.name);
       var crc = crc32(e.data);
       var locLen = 30 + nameB.length;
       var cenLen = 46 + nameB.length;
@@ -163,7 +162,7 @@ var ZHR = (function () {
     return '<w:p>' + ppr + runsXml + '</w:p>';
   }
 
-  function TYPE_LABEL(t) {
+  function typeLabel(t) {
     return { single: '单选', multi: '多选', judge: '判断', fill: '填空', other: '其他' }[t] || (t || '');
   }
 
@@ -187,7 +186,7 @@ var ZHR = (function () {
       (sec.questions || []).forEach(function (q, idx) {
         total++;
         var qn = (idx + 1) + '. ';
-        var t = TYPE_LABEL(q.type);
+        var t = typeLabel(q.type);
         var body = qn + (t ? '【' + t + '】' : '') + (q.stem || '');
         paraXml += wPara(wRun(body, { size: 21 }), 40);
         var ol = optionsLine(q);
@@ -312,20 +311,29 @@ var ZHR = (function () {
   }
 
   function coursesToDoc(course) {
-    var sections = [];
-    var chapters = course.chapters || {};
-    Object.keys(chapters).forEach(function (name) {
-      var ch = chapters[name];
-      sections.push({ name: name, questions: (ch.questions || []).map(function (q) { return { stem: q.stem, type: q.type, options: q.options, answer: q.answer }; }) });
+    /* 全局题库 → 按章节分组（保持首次出现顺序），供 Word 排版 */
+    var order = [];
+    var byChapter = {};
+    (course.questions || []).forEach(function (q) {
+      var ch = q.chapter || '未命名章节';
+      if (!(ch in byChapter)) { byChapter[ch] = []; order.push(ch); }
+      byChapter[ch].push({ stem: q.stem, type: q.type, options: q.options, answer: q.answer });
     });
-    return { course: course.name, sections: sections };
+    return { course: course.name, sections: order.map(function (n) { return { name: n, questions: byChapter[n] }; }) };
   }
 
   /* ================================================================
    *  以下为浏览器端（DOM 识别 / UI），Node 环境不执行
    * ================================================================ */
 
-  var OPT_RE = /^[（(]?([A-Ha-h])[)）.、:：]\s*/;
+  var OPT_RE = /^[（(]?([A-Ha-hＡ-Ｈａ-ｈ])[)）.．、:：]\s*/;
+  /* 全角/半角拉丁字母归一（Ａ→A） */
+  function normLetter(ch) {
+    var code = ch.charCodeAt(0);
+    if (code >= 0xFF21 && code <= 0xFF3A) return String.fromCharCode(code - 0xFEE0);
+    if (code >= 0xFF41 && code <= 0xFF5A) return String.fromCharCode(code - 0xFEE0);
+    return ch;
+  }
   var ANSWER_LINE_RE = /(正确答案|参考答案|标准答案|正确答案是)/;
   var ANSWER_LINE_ANY_RE = /答案[:：]?\s*([^\n]{0,60})/;
   var CORRECT_CLS_RE = /\b(correct|right|answer|daan|green|succ|pass|true)\w*/i;
@@ -394,7 +402,7 @@ var ZHR = (function () {
       }
       var m = L.match(OPT_RE);
       if (m) {
-        options.push({ letter: m[1].toUpperCase(), text: L.replace(OPT_RE, '').trim() });
+        options.push({ letter: normLetter(m[1]).toUpperCase(), text: L.replace(OPT_RE, '').trim() });
         continue;
       }
       if (ansLineIdx === -1) stemLines.push(L);
@@ -406,9 +414,11 @@ var ZHR = (function () {
   function typeOf(stem, options, radios, checks) {
     var s = stem || '';
     if (/多选|多项/.test(s) || checks > 0) return 'multi';
-    if (/判断|（\s*）|对错/.test(s) || (options.length === 2 && /正确/.test(options[0].text) && /错误/.test(options[1].text))) return 'judge';
+    var isJudge = /判断/.test(s) ||
+      (options.length === 2 && /^(正确|对)/.test(options[0].text) && /^(错误|错)/.test(options[1].text));
+    if (isJudge) return 'judge';
     if (radios > 0 || options.length) return 'single';
-    if (/填空|___|＿+|（\s*）|\(\)/.test(s)) return 'fill';
+    if (/填空|___|＿+|（\s*）|\(\s*\)/.test(s)) return 'fill';
     return 'other';
   }
 
@@ -417,12 +427,16 @@ var ZHR = (function () {
     var m = lineText.match(ANSWER_LINE_ANY_RE);
     var rest = m ? m[1] : lineText;
     rest = rest.replace(/^(是|为|：|:|:)/, '').trim();
-    var letters = rest.match(/[A-Ha-h]/g);
-    if (letters && letters.length) {
-      var uniq = [];
-      letters.forEach(function (L) { var u = L.toUpperCase(); if (uniq.indexOf(u) < 0) uniq.push(u); });
-      return uniq.join('');
+    /* 只取“答案”后开头连续的一段字母（A、B、C / AB 及全角），避免吞入后文解析文字 */
+    var lead = rest.match(/^[A-Ha-hＡ-Ｈａ-ｈ\s、，,和]+/);
+    var letters = [];
+    if (lead) {
+      (lead[0] || '').split('').forEach(function (ch) {
+        var a = normLetter(ch).toUpperCase();
+        if (/[A-H]/.test(a) && letters.indexOf(a) < 0) letters.push(a);
+      });
     }
+    if (letters.length) return letters.join('');
     return normWs(rest).slice(0, 80);
   }
 
@@ -437,7 +451,7 @@ var ZHR = (function () {
       if (MARKED_WRONG_RE.test(c)) continue;
       var t = normWs(innerTextOf(el));
       var m = t.match(OPT_RE);
-      if (m && found.indexOf(m[1].toUpperCase()) < 0) found.push(m[1].toUpperCase());
+      if (m) { var l = normLetter(m[1]).toUpperCase(); if (found.indexOf(l) < 0) found.push(l); }
     }
     return found.join('');
   }
@@ -519,7 +533,7 @@ var ZHR = (function () {
     if (!wrap) return;
     var t = document.createElement('div');
     t.textContent = msg;
-    t.style.cssText = 'position:fixed;right:16px;bottom:64px;z-index:2147483647;background:' + (isError ? '#c0392b' : '#27ae60') +
+    t.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483647;background:' + (isError ? '#c0392b' : '#27ae60') +
       ';color:#fff;padding:10px 16px;border-radius:6px;font:13px/1.5 "Microsoft YaHei",sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.3);max-width:70vw;word-break:break-all;transition:opacity .4s';
     wrap.appendChild(t);
     setTimeout(function () {
@@ -568,7 +582,6 @@ var ZHR = (function () {
     function close() { if (mask.parentNode) mask.parentNode.removeChild(mask); }
     bClose.addEventListener('click', close);
     mask.addEventListener('click', function (e) { if (e.target === mask) close(); });
-    return { mask: mask, body: body };
   }
 
   /* ---------------- 存储（GM_* 跨子域共享） ---------------- */
@@ -577,12 +590,20 @@ var ZHR = (function () {
   function loadCourseList() { return JSON.parse(GM_getValue(K_INDEX, 'null')) || []; }
   function courseKeyFor(name) { return 'zhr.v1.course.' + djb2(name || '未命名课程'); }
   function loadCourse(name) {
-    var key = courseKeyFor(name);
-    var c = JSON.parse(GM_getValue(key, 'null'));
-    if (c && c.questions) {
-      /* 旧版扁平结构兼容（无 chapters 时） */
-      return c;
+    var c = JSON.parse(GM_getValue(courseKeyFor(name), 'null'));
+    if (!c) return null;
+    if (c.chapters) {
+      /* 旧版 {chapters:{章:[题]}} 摊平成全局题库（按 chapter 字段归章） */
+      var qs = [];
+      Object.keys(c.chapters).forEach(function (k) {
+        (c.chapters[k].questions || []).forEach(function (q) {
+          if (!q.chapter) q.chapter = k;
+          qs.push(q);
+        });
+      });
+      c = { name: c.name, questions: qs };
     }
+    if (!c.questions) c.questions = [];
     return c;
   }
   function saveCourse(name, data) {
@@ -597,13 +618,16 @@ var ZHR = (function () {
 
   /* ---------------- 核心动作 ---------------- */
 
+  function currentCourseGuess() {
+    var inp = document.getElementById('zhr-course-input');
+    return normWs(inp ? inp.value : '') || guessCourseName();
+  }
+
   function doRecord() {
     var containers = findQuestionContainers(document);
     var chapterGuess = guessChapterName();
-    var courseGuess = guessCourseName();
-    var courseInput = document.getElementById('zhr-course-input');
     var chapterInput = document.getElementById('zhr-chapter-input');
-    var courseName = normWs(courseInput ? courseInput.value : '') || courseGuess;
+    var courseName = currentCourseGuess();
     var chapterName = normWs(chapterInput ? chapterInput.value : '') || chapterGuess || '未命名章节';
 
     if (!containers.length) {
@@ -624,23 +648,11 @@ var ZHR = (function () {
       return { ok: false, reason: 'parse-failed' };
     }
 
-    var course = loadCourse(courseName) || { name: courseName, chapters: {}, questions: null };
-    if (course.questions && !course.chapters) {
-      /* 迁移扁平旧结构到 chapters（保险，通常不发生） */
-      course.chapters = {};
-      course.chapters['旧记录'] = { questions: course.questions };
-      delete course.questions;
-    }
-    if (!course.chapters) course.chapters = {};
-    if (!course.chapters[chapterName]) course.chapters[chapterName] = { questions: [], updatedAt: Date.now() };
-    var ch = course.chapters[chapterName];
-    var res = mergeQuestions(ch.questions, incoming);
-    ch.questions = res.list;
-    ch.updatedAt = Date.now();
+    var course = loadCourse(courseName) || { name: courseName, questions: [] };
+    var res = mergeQuestions(course.questions, incoming);
+    course.questions = res.list;
     saveCourse(courseName, course);
-
-    var totalAll = 0;
-    Object.keys(course.chapters).forEach(function (k) { totalAll += course.chapters[k].questions.length; });
+    var totalAll = course.questions.length;
 
     toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题；该课累计 ' + totalAll + ' 题');
     return { ok: true, added: res.added.length, variants: res.variants.length, skipped: res.skipped, failed: failed, totalAll: totalAll };
@@ -668,21 +680,18 @@ var ZHR = (function () {
       var txt = normWs(document.body.innerText);
       out.push('-- body 文本预览（前 1200 字，用于人工定位）--');
       out.push(txt.slice(0, 1200));
-      var kwCount = 0;
       var tags = document.querySelectorAll('[class*="question" i],[class*="timu"],[class*="subject" i],[class*="item"],[id*="question" i],[id*="timu"]');
       out.push('keywordElems=' + tags.length + '（下列为前 25 个的 class）');
       for (var k = 0; k < tags.length && k < 25; k++) {
         var el = tags[k];
         out.push('  <' + el.tagName.toLowerCase() + '> class="' + clsOf(el).slice(0, 60) + '" text=' + normWs(el.innerText).slice(0, 30));
-        kwCount++;
       }
     }
     return out.join('\n');
   }
 
   function doExportWord() {
-    var courseInput = document.getElementById('zhr-course-input');
-    var courseName = normWs(courseInput ? courseInput.value : '') || guessCourseName();
+    var courseName = currentCourseGuess();
     if (!courseName) { toast('未能确定课程名，请在面板课程框里手动填写。', true); return; }
     var course = loadCourse(courseName);
     if (!course) { toast('该课程还没有任何记录，先做一章点「开始记录」。', true); return; }
@@ -702,12 +711,11 @@ var ZHR = (function () {
   }
 
   function doClearCourse() {
-    var courseInput = document.getElementById('zhr-course-input');
-    var courseName = normWs(courseInput ? courseInput.value : '') || guessCourseName();
+    var courseName = currentCourseGuess();
     if (!courseName) { toast('未确定课程名。', true); return; }
     if (!window.confirm('确定清空课程「' + courseName + '」的全部记录？此操作不可恢复。')) return;
     if (!window.confirm('再次确认：真的要清空吗？')) return;
-    GM_setValue(courseKeyFor(name || courseName), 'null');
+    GM_setValue(courseKeyFor(courseName), 'null');
     var list = loadCourseList().filter(function (c) { return c.name !== courseName; });
     GM_setValue(K_INDEX, JSON.stringify(list));
     toast('已清空课程：' + courseName);
@@ -722,7 +730,7 @@ var ZHR = (function () {
     window.__zhrV1UI = true;
 
     GM_addStyle(
-      '#zhr-root{position:fixed;left:16px;bottom:16px;z-index:2147483646;font:12px/1.5 "Microsoft YaHei",sans-serif;color:#222;width:330px;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.25);background:#fff;overflow:hidden}' +
+      '#zhr-root{position:fixed;right:16px;bottom:16px;z-index:2147483646;font:12px/1.5 "Microsoft YaHei",sans-serif;color:#222;width:330px;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.25);background:#fff;overflow:hidden}' +
       '#zhr-head{background:#2f6fed;color:#fff;padding:8px 12px;cursor:move;font-weight:700;display:flex;align-items:center;user-select:none}' +
       '#zhr-head .t{flex:1}' +
       '#zhr-head button{background:transparent;border:0;color:#fff;cursor:pointer;font-size:14px;padding:0 2px 0 8px}' +
