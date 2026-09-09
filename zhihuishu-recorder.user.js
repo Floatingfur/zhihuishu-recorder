@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.1.0
+// @version      1.2.0
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。纯本地运行，不联网、不自动答题。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
 
   /* ---------------- 基础工具（纯函数） ---------------- */
 
@@ -391,7 +391,7 @@ var ZHR = (function () {
   /* 从一个题目容器的行文本里解析题干/选项/答案（行文本模型，兼容多数布局） */
   function parseLines(containerText) {
     var lines = splitLines(containerText);
-    var stemLines = [], options = [], ansText = '', ansLineIdx = -1;
+    var stemLines = [], options = [], bareOpts = [], ansText = '', ansLineIdx = -1;
     for (var i = 0; i < lines.length; i++) {
       var L = lines[i];
       if (ANSWER_LINE_RE.test(L)) {
@@ -400,14 +400,27 @@ var ZHR = (function () {
         ansText = L;
         continue;
       }
+      /* 状态行/自答行/解析/知识点：不进入题干 */
+      if (/^(我的答案|您的答案|回答正确|回答错误|答对|答错|已作答|未作答|答案解析|解析|考查知识点|知识点)/.test(L)) continue;
       var m = L.match(OPT_RE);
       if (m) {
         options.push({ letter: normLetter(m[1]).toUpperCase(), text: L.replace(OPT_RE, '').trim() });
         continue;
       }
+      /* 无字母前缀的判断题短选项（对/错/正确/错误/是/否/√/×） */
+      if (/^(对|错|正确|错误|是|否|√|×)$/.test(L)) { bareOpts.push(L); continue; }
       if (ansLineIdx === -1) stemLines.push(L);
     }
-    var stem = normalizeStem(stemLines.join(' '));
+    var stem = normWs(stemLines.join(' '));
+    /* 去掉开头的题型标签（单选 题 / 判断 题 ...），其后的题号由 normalizeStem 剥离 */
+    stem = stem.replace(/^(单选|多选|判断|填空|简答|不定项|单项选择|多项选择)\s*题?\s*(?=\d)/, '');
+    stem = normalizeStem(stem);
+    /* 判断题：字母选项缺失时，用裸的对/错选项补上 */
+    if (!options.length && bareOpts.length) {
+      for (var j = 0; j < bareOpts.length; j++) {
+        options.push({ letter: String.fromCharCode(65 + j), text: bareOpts[j] });
+      }
+    }
     return { stem: stem, options: options, answerLine: ansText };
   }
 
@@ -861,6 +874,7 @@ var ZHR = (function () {
     crc32: crc32, zipStore: zipStore, buildDocx: buildDocx,
     stemKey: stemKey, optsHash: optsHash, mergeQuestions: mergeQuestions,
     coursesToDoc: coursesToDoc,
+    parseLines: parseLines, typeOf: typeOf,
     init: initUI
   };
 })();
