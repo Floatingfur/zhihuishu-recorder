@@ -587,10 +587,19 @@ var ZHR = (function () {
   /* ---------------- 存储（GM_* 跨子域共享） ---------------- */
 
   var K_INDEX = 'zhr.v1.index';
-  function loadCourseList() { return JSON.parse(GM_getValue(K_INDEX, 'null')) || []; }
+  /* GM 权限缺失时降级到同源 localStorage（面板/记录仍可用；跨子域共享退化为同源） */
+  function sGet(k) {
+    try { if (typeof GM_getValue === 'function') return GM_getValue(k, null); } catch (e) { /* ignore */ }
+    try { return localStorage.getItem('zhrgm.' + k); } catch (e2) { return null; }
+  }
+  function sSet(k, v) {
+    try { if (typeof GM_setValue === 'function') { GM_setValue(k, v); return; } } catch (e) { /* ignore */ }
+    try { localStorage.setItem('zhrgm.' + k, v); } catch (e2) { /* ignore */ }
+  }
+  function loadCourseList() { return JSON.parse(sGet(K_INDEX) || 'null') || []; }
   function courseKeyFor(name) { return 'zhr.v1.course.' + djb2(name || '未命名课程'); }
   function loadCourse(name) {
-    var c = JSON.parse(GM_getValue(courseKeyFor(name), 'null'));
+    var c = JSON.parse(sGet(courseKeyFor(name)) || 'null');
     if (!c) return null;
     if (c.chapters) {
       /* 旧版 {chapters:{章:[题]}} 摊平成全局题库（按 chapter 字段归章） */
@@ -607,13 +616,13 @@ var ZHR = (function () {
     return c;
   }
   function saveCourse(name, data) {
-    GM_setValue(courseKeyFor(name), JSON.stringify(data));
+    sSet(courseKeyFor(name), JSON.stringify(data));
     var list = loadCourseList();
     var hit = null;
     for (var i = 0; i < list.length; i++) if (list[i].name === name) { hit = list[i]; break; }
     if (!hit) { hit = { name: name }; list.push(hit); }
     hit.updatedAt = Date.now();
-    GM_setValue(K_INDEX, JSON.stringify(list));
+    sSet(K_INDEX, JSON.stringify(list));
   }
 
   /* ---------------- 核心动作 ---------------- */
@@ -715,10 +724,17 @@ var ZHR = (function () {
     if (!courseName) { toast('未确定课程名。', true); return; }
     if (!window.confirm('确定清空课程「' + courseName + '」的全部记录？此操作不可恢复。')) return;
     if (!window.confirm('再次确认：真的要清空吗？')) return;
-    GM_setValue(courseKeyFor(courseName), 'null');
+    sSet(courseKeyFor(courseName), 'null');
     var list = loadCourseList().filter(function (c) { return c.name !== courseName; });
-    GM_setValue(K_INDEX, JSON.stringify(list));
+    sSet(K_INDEX, JSON.stringify(list));
     toast('已清空课程：' + courseName);
+  }
+
+  function addStyle(css) {
+    try { if (typeof GM_addStyle === 'function') { GM_addStyle(css); return; } } catch (e) { /* fallback below */ }
+    var st = document.createElement('style');
+    st.textContent = css;
+    (document.head || document.documentElement).appendChild(st);
   }
 
   function initUI() {
@@ -728,8 +744,9 @@ var ZHR = (function () {
     var showHere = (window.top === window) || bodyLen >= 1200;
     if (!showHere) return;
     window.__zhrV1UI = true;
+    try { if (window.console && console.log) console.log('[ZHR v' + VERSION + '] init on ' + location.href + ' | top=' + (window.top === window)); } catch (e2) { /* ignore */ }
 
-    GM_addStyle(
+    addStyle(
       '#zhr-root{position:fixed;right:16px;bottom:16px;z-index:2147483646;font:12px/1.5 "Microsoft YaHei",sans-serif;color:#222;width:330px;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.25);background:#fff;overflow:hidden}' +
       '#zhr-head{background:#2f6fed;color:#fff;padding:8px 12px;cursor:move;font-weight:700;display:flex;align-items:center;user-select:none}' +
       '#zhr-head .t{flex:1}' +
