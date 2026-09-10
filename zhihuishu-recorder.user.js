@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.6.1
+// @version      1.7.0
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.6.1';
+  var VERSION = '1.7.0';
 
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
@@ -964,17 +964,30 @@ var ZHR = (function () {
    */
   var DANGER_RE = /(提交|交卷|上交|放弃|结束|删除|清空|保存并提交|确认提交|立即提交)/;
   var BTN_VIEW_RE = /(查看解析|查看答案解析|查看答案|试题解析)/;
-  var BTN_ENTRY_RE = /(去提升|开始提升|进入提升|去练习|开始练习)/;
-  var BTN_EXIT_RE = /(退出|返回课程|返回目录|回到视频|关闭本页|关闭)/;
+  var BTN_ENTRY_RE = /(去提升|开始提升|进入提升|提升训练|去练习|开始练习|进入练习|去答题)/;
+  var BTN_EXIT_RE = /(退出|返回|关闭|回到视频|返回目录|返回课程)/;
   var BTN_NEXT_RE = /(下一题|下一页|下一道)/;
+  var CLOSE_SIG_RE = /(close|exit|back|关闭|退出|返回)/i;
 
-  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [] };
+  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, emptyInThisVideo: false, emptyRounds: 0, catalogExhausted: false };
 
   function pilotLog(msg) {
     PILOT.logs.push(new Date().toLocaleTimeString('zh-CN') + ' ' + msg);
     if (PILOT.logs.length > 30) PILOT.logs.shift();
     var el = uiDoc().getElementById('zhr-pilotlog');
     if (el) el.textContent = PILOT.logs.slice(-3).join('\n');
+  }
+
+  /* 当前文档 + 同源 iframe 文档（“去提升/退出”按钮与题目常在 iframe 里） */
+  function pilotDocs() {
+    var docs = [document];
+    var ifs = document.querySelectorAll('iframe');
+    for (var i = 0; i < ifs.length; i++) {
+      var d = null;
+      try { d = ifs[i].contentDocument; } catch (e) { d = null; }
+      if (d && d !== document) docs.push(d);
+    }
+    return docs;
   }
 
   function pilotVisible(el) {
@@ -989,85 +1002,177 @@ var ZHR = (function () {
     return true;
   }
 
-  /* 找可见、文本匹配白名单、且不含危险词的按钮并点击；返回被点击的文本或 null */
-  function pilotClick(re) {
-    var els = document.querySelectorAll('button,a,[role="button"],li,span,div,em,i,p');
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i];
-      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
-      if (!pilotVisible(el)) continue;
-      var t = normWs(el.innerText || el.textContent || '');
-      if (!t || t.length > 16) continue;
-      if (DANGER_RE.test(t)) continue;
-      if (!re.test(t)) continue;
-      var inner = el.querySelector('button,a,[role="button"]');
-      if (inner && inner !== el) continue;
-      try { el.click(); return t; } catch (e2) { continue; }
+  /* 模拟真实点击：滚动到可见 + 完整鼠标事件序列（很多页面只认 pointerdown/mousedown） */
+  function pilotFireClick(el) {
+    try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { /* ignore */ }
+    var w = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    var opt = { bubbles: true, cancelable: true, view: w };
+    var seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+    for (var i = 0; i < seq.length; i++) {
+      var type = seq[i];
+      try {
+        var Ctor = (type.indexOf('pointer') === 0 && w.PointerEvent) ? w.PointerEvent : w.MouseEvent;
+        el.dispatchEvent(new Ctor(type, opt));
+      } catch (e2) { /* ignore */ }
     }
-    return null;
   }
 
-  /* 只取“屏幕上可见”的题目容器：隐藏的题（未展开的解析等）不算在内 */
-  function pilotContainers() {
-    var all = findQuestionContainers(document);
-    var out = [];
-    for (var i = 0; i < all.length; i++) if (pilotVisible(all[i])) out.push(all[i]);
-    return out;
-  }
-
-  /* 侧边目录：找“当前项(active/current/selected)”的下一项并点击 */
-  function pilotNextCatalog() {
-    var sel = '[class*="catalog" i] li,[class*="chapter" i] li,[class*="section" i] li,' +
-              '[class*="menu" i] li,[class*="nav" i] li,[class*="list" i] li,[class*="menu" i] a,[class*="nav" i] a';
-    var items = document.querySelectorAll(sel);
-    var list = [];
-    for (var i = 0; i < items.length; i++) if (pilotVisible(items[i])) list.push(items[i]);
-    if (list.length < 2) return null;
-    for (var j = 0; j < list.length; j++) {
-      if (!/(active|current|selected|checked)/i.test(clsOf(list[j]))) continue;
-      for (var k = j + 1; k < list.length; k++) {
-        var t = normWs(list[k].innerText || '');
-        if (!t || DANGER_RE.test(t) || t.length > 40) continue;
-        if (list[k].closest && list[k].closest('#zhr-root,#zhr-scout-root')) continue;
-        try { list[k].click(); return t.slice(0, 24); } catch (e) { return null; }
+  /* 在所有文档里找：可见 + 文案匹配白名单 + 不含危险词 的元素 */
+  function pilotFind(re, maxLen) {
+    var docs = pilotDocs();
+    for (var d = 0; d < docs.length; d++) {
+      var qs;
+      try { qs = docs[d].querySelectorAll('button,a,li,span,div,em,i,p,label,[role="button"]'); } catch (e) { continue; }
+      for (var i = 0; i < qs.length; i++) {
+        var el = qs[i];
+        if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+        if (!pilotVisible(el)) continue;
+        var t = normWs(el.innerText || el.textContent || '');
+        if (!t || t.length > (maxLen || 16)) continue;
+        if (DANGER_RE.test(t)) continue;
+        if (!re.test(t)) continue;
+        var inner = el.querySelector('button,a,[role="button"]');
+        if (inner && inner !== el) continue;
+        return { el: el, text: t };
       }
     }
     return null;
+  }
+
+  function pilotClick(re, maxLen) {
+    var hit = pilotFind(re, maxLen);
+    if (!hit) return null;
+    pilotFireClick(hit.el);
+    return hit.text;
+  }
+
+  /* 无文字的图标按钮兔底：class/title/aria-label 含 close/exit/back/关闭/退出/返回 */
+  function pilotClickIcon(re) {
+    var docs = pilotDocs();
+    for (var d = 0; d < docs.length; d++) {
+      var els;
+      try { els = docs[d].querySelectorAll('[class*="close" i],[class*="exit" i],[class*="back" i],[aria-label],[title]'); } catch (e) { continue; }
+      for (var i = 0; i < els.length && i < 400; i++) {
+        var el = els[i];
+        if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+        if (!pilotVisible(el)) continue;
+        var sig = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + clsOf(el);
+        if (!re.test(sig)) continue;
+        if (DANGER_RE.test(normWs(el.innerText || ''))) continue;
+        pilotFireClick(el);
+        return normWs(sig).slice(0, 24);
+      }
+    }
+    return null;
+  }
+
+  /* 只取“屏幕上可见”的题目容器（含同源 iframe）；隐藏的未展开解析不算 */
+  function pilotContainers() {
+    var docs = pilotDocs();
+    var out = [];
+    for (var d = 0; d < docs.length; d++) {
+      var all = [];
+      try { all = findQuestionContainers(docs[d]); } catch (e) { all = []; }
+      for (var i = 0; i < all.length; i++) if (pilotVisible(all[i])) out.push(all[i]);
+    }
+    return out;
+  }
+
+  function pilotCatalogItems() {
+    var sel = '[class*="catalog" i] li,[class*="chapter" i] li,[class*="section" i] li,' +
+              '[class*="menu" i] li,[class*="nav" i] li,[class*="list" i] li,' +
+              '[class*="catalog" i] a,[class*="chapter" i] a,[class*="menu" i] a,[class*="nav" i] a';
+    var items = document.querySelectorAll(sel);
+    var list = [];
+    for (var i = 0; i < items.length; i++) if (pilotVisible(items[i])) list.push(items[i]);
+    return list;
+  }
+
+  /* 顺序切到下一个视频/节点（首次从当前高亮项往下走，之后递增，不重复点同一项） */
+  function pilotNextCatalog() {
+    var list = pilotCatalogItems();
+    if (!list.length) return null;
+    var idx = PILOT.catalogIdx;
+    if (idx === null || idx === undefined || idx < 0) {
+      idx = -1;
+      for (var i = 0; i < list.length; i++) { if (isActiveItem(list[i])) { idx = i; break; } }
+    }
+    var next = idx + 1;
+    if (next >= list.length) { PILOT.catalogExhausted = true; pilotLog('目录已到最后一节'); return null; }
+    var el = list[next];
+    var t = normWs(el.innerText || '');
+    if (DANGER_RE.test(t)) { PILOT.catalogIdx = next; return null; }
+    PILOT.catalogIdx = next;
+    PILOT.catalogExhausted = false;
+    pilotFireClick(el);
+    return t.slice(0, 24);
   }
 
   function pilotStep() {
     if (!PILOT.running) return;
     if (++PILOT.steps > PILOT.maxSteps) { pilotStop('已达步数上限'); return; }
 
-    /* 1) 本页有“可见”的题目/解析 → 读取，然后翻页或退出 */
+    /* 1) 本页有可见题目 → 读取 */
     var conts = pilotContainers();
     if (conts.length) {
-      var r = doRecord(true, conts);
-      pilotLog('读取本页：新增 ' + ((r && r.added) || 0) + ' 题');
-      var nx = pilotClick(BTN_NEXT_RE);
-      if (nx) { pilotLog('→ 下一题（' + nx + '）'); return; }
-      var ex = pilotClick(BTN_EXIT_RE);
-      if (ex) { pilotLog('→ 退出（' + ex + '）'); return; }
-      var n1 = pilotNextCatalog();
-      if (n1) { pilotLog('→ 切换目录项（' + n1 + '）'); return; }
-      pilotLog('本页已读；未找到「下一题/退出/目录」，等待…');
+      var r = doRecord(true, conts) || {};
+      var added = r.added || 0;
+      pilotLog('读取本页：新增 ' + added + ' 题');
+      if (added > 0) {
+        PILOT.emptyInThisVideo = false;
+        PILOT.emptyRounds = 0;
+        PILOT.idle = 0;
+        var nx = pilotClick(BTN_NEXT_RE, 16);
+        if (nx) { pilotLog('→ 下一题（' + nx + '）'); return; }
+      } else {
+        /* 新增 0 题：本视频的提升已读完，退出后不再重复进入 */
+        PILOT.emptyInThisVideo = true;
+        PILOT.emptyRounds = (PILOT.emptyRounds || 0) + 1;
+        if (PILOT.emptyRounds >= 3) { pilotStop('连续 3 个提升均为空，已停止'); return; }
+      }
+      var ex = pilotClick(BTN_EXIT_RE, 20) || pilotClickIcon(CLOSE_SIG_RE);
+      if (ex) { PILOT.idle = 0; pilotLog('→ 退出（' + ex + '）'); return; }
+      PILOT.idle = (PILOT.idle || 0) + 1;
+      pilotLog('本页已读，但未找到「退出」按钮（' + PILOT.idle + '/3）');
+      if (PILOT.idle >= 3) pilotStop('找不到退出按钮');
       return;
     }
-    /* 2) 打开解析 */
-    var v = pilotClick(BTN_VIEW_RE);
-    if (v) { pilotLog('→ 查看解析（' + v + '）'); return; }
-    /* 3) 进入提升 */
-    var en = pilotClick(BTN_ENTRY_RE);
-    if (en) { pilotLog('→ 进入（' + en + '）'); return; }
-    /* 4) 切下一个目录项（视频/节点） */
+
+    /* 2) 刚读完一个视频的提升 → 直接切下一个视频/节点 */
+    if (PILOT.emptyInThisVideo) {
+      PILOT.emptyInThisVideo = false;
+      var n0 = pilotNextCatalog();
+      if (n0) { PILOT.idle = 0; pilotLog('→ 下个视频/节点（' + n0 + '）'); return; }
+      if (PILOT.catalogExhausted) { pilotStop('已遍历到最后一个视频'); return; }
+    }
+
+    /* 3) 打开解析 */
+    var v = pilotClick(BTN_VIEW_RE, 16);
+    if (v) { PILOT.idle = 0; pilotLog('→ 查看解析（' + v + '）'); return; }
+
+    /* 4) 进入提升 */
+    var en = pilotClick(BTN_ENTRY_RE, 16);
+    if (en) { PILOT.idle = 0; pilotLog('→ 进入（' + en + '）'); return; }
+
+    /* 5) 切下一个目录项 */
     var n2 = pilotNextCatalog();
-    if (n2) { pilotLog('→ 切换目录项（' + n2 + '）'); return; }
-    pilotLog('未找到可操作项；请手动切到下一个视频/解析页后继续');
+    if (n2) { PILOT.idle = 0; pilotLog('→ 下个视频/节点（' + n2 + '）'); return; }
+
+    PILOT.idle = (PILOT.idle || 0) + 1;
+    pilotLog('未找到可操作项（' + PILOT.idle + '/3）');
+    if (PILOT.idle >= 3) pilotStop('连续未找到可操作项');
   }
 
   function pilotStart() {
     if (PILOT.running) return;
-    PILOT.running = true; PILOT.steps = 0; PILOT.logs = [];
+    PILOT.running = true;
+    PILOT.steps = 0;
+    PILOT.logs = [];
+    PILOT.idle = 0;
+    PILOT.catalogIdx = null;
+    PILOT.emptyInThisVideo = false;
+    PILOT.emptyRounds = 0;
+    PILOT.catalogExhausted = false;
     pilotLog('开始自动遍历（不答题、不提交）');
     var b = uiDoc().getElementById('zhr-b6');
     if (b) b.textContent = '⏹ 停止遍历';
