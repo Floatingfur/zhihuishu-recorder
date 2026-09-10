@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.5.2
+// @version      1.6.0
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.5.2';
+  var VERSION = '1.6.0';
 
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
@@ -580,33 +580,156 @@ var ZHR = (function () {
     };
   }
 
-  /* 课程名 / 章节名猜测 */
-  function guessCourseName() {
-    var title = document.title || '';
-    var m = title.match(/(.{1,40}?)[-_—|]?(智慧树|知到)/);
-    if (m && m[1]) return normWs(m[1].replace(/^[\s\-—_|:：]+/, ''));
-    var heads = document.querySelectorAll('h1,h2,h3,.courseName,.course-name,.name,.title');
-    for (var i = 0; i < heads.length && i < 30; i++) {
-      var t = normWs(heads[i].innerText || '');
-      if (t && t.length <= 40) return t;
+  /* ---------------- 课程名 / 章节名识别 ----------------
+   *  思路：优先读左侧目录树里“当前高亮项”，章节名 = 所在章（若高亮的是章则取它下面第一个单元），
+   *  再依次回退到页面标题/面包屑/正文里的“第X章”。
+   */
+  var CHAP_RE = /(第\s*[0-9一二三四五六七八九十百零]+\s*[章节讲单元模块篇]|Chapter\s*\d+|Unit\s*\d+|Module\s*\d+)/i;
+  var UNIT_RE = /^(\d+(\.\d+)+\s*|第\s*[0-9一二三四五六七八九十百零]+\s*[节讲课]|\d+\s*[-、．.]\s*)/;
+
+  function visOk(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    var w = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    try {
+      var cs = w.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    } catch (e) { /* ignore */ }
+    return true;
+  }
+
+  /* 收集侧边目录/章节树中的可见条目（按文档顺序），取“最像目录”的那个容器 */
+  function collectCatalogItems() {
+    var sel = '[class*="catalog" i],[class*="catalogue" i],[class*="chapter" i],[class*="tree" i],' +
+              '[class*="directory" i],[class*="menu" i],[class*="nav" i],[class*="sider" i],' +
+              '[class*="aside" i],[class*="knowledge" i],[class*="outline" i],[class*="catalogItem" i]';
+    var scopes = document.querySelectorAll(sel);
+    var best = null;
+    for (var i = 0; i < scopes.length; i++) {
+      var sc = scopes[i];
+      if (sc.closest && sc.closest('#zhr-root,#zhr-scout-root')) continue;
+      if (/\b(question|timu|exam|test|answer|result|choice)\b/i.test(clsOf(sc))) continue;  /* 别把题目区当目录 */
+      if (!visOk(sc)) continue;
+      var els = sc.querySelectorAll('a,li');
+      var items = [];
+      for (var j = 0; j < els.length && items.length < 200; j++) {
+        var el = els[j];
+        if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+        if (!visOk(el)) continue;
+        var t = cleanText(el.innerText || '');
+        if (!t || t.length > 40) continue;
+        items.push({ el: el, t: t });
+      }
+      if (items.length >= 3 && (!best || items.length > best.length)) best = items;
     }
+    return best;
+  }
+
+  function isActiveItem(el) {
+    if (!el) return false;
+    var c = clsOf(el);
+    if (/(active|current|selected|checked|focus|on$|\bon\b)/i.test(c)) return true;
+    try {
+      if (el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-current')) return true;
+    } catch (e) { /* ignore */ }
+    var p = el.parentElement;
+    if (p) {
+      var pc = clsOf(p);
+      if (/(active|current|selected|checked|focus)/i.test(pc)) return true;
+    }
+    return false;
+  }
+
+  function joinLoc(chap, unit) {
+    chap = cleanText(chap); unit = cleanText(unit);
+    if (chap && unit && chap !== unit) return chap + ' · ' + unit;
+    return chap || unit || '';
+  }
+
+  function guessCourseName() {
+    var title = normWs(document.title || '');
+    /* 1) 标题："课程名 - 智慧树" / "智慧树 - 课程名" */
+    var m = title.match(/^(.*?)\s*[-_—|｜]\s*(智慧树|知到)/);
+    if (m && m[1] && !/登录|首页|智慧树|知到/.test(m[1])) return cleanText(m[1]);
+    var m2 = title.match(/(?:智慧树|知到)\s*[-_—|｜]\s*(.+)$/);
+    if (m2 && m2[1]) return cleanText(m2[1]);
+    /* 2) 明确的“课程名”元素 / 面包屑 */
+    var sels = ['[class*="courseName" i]', '[class*="course-name" i]', '[class*="course_title" i]',
+                '[class*="courseTitle" i]', '[class*="course" i] h1', '[class*="course" i] h2',
+                '[class*="course" i] h3', '[class*="breadcrumb" i] a', '[class*="crumb" i] a',
+                '[class*="breadcrumb" i] span', 'h1', 'h2'];
+    for (var i = 0; i < sels.length; i++) {
+      var els = document.querySelectorAll(sels[i]);
+      for (var j = 0; j < els.length && j < 10; j++) {
+        if (els[j].closest && els[j].closest('#zhr-root,#zhr-scout-root')) continue;
+        var t = cleanText(els[j].innerText || els[j].textContent || '');
+        if (!t || t.length < 2 || t.length > 40) continue;
+        if (/^(首页|主页|登录|智慧树|知到|我的|课程中心|学习中心|个人中心)$/.test(t)) continue;
+        if (CHAP_RE.test(t)) continue;               /* 像章节名的不当课程名 */
+        return t;
+      }
+    }
+    /* 3) 退一步用标题（去掉站点名） */
+    if (title && title.length <= 40 && !/智慧树|知到|登录/.test(title)) return cleanText(title);
     return '';
   }
 
   function guessChapterName() {
-    var re = /第\s*[0-9一二三四五六七八九十百零]+\s*[章节讲单元课]/;
-    var els = document.querySelectorAll('h1,h2,h3,h4,.chapter,.section,.unit,li,span,div,b,strong,p');
-    var best = '';
-    for (var i = 0; i < els.length && i < 200; i++) {
-      var el = els[i];
-      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
-      var t = normWs(el.innerText || '');
-      if (!t || t.length > 60) continue;
-      if (re.test(t)) {
-        if (!best || t.length < best.length) best = t;
+    var items = collectCatalogItems();
+    if (items && items.length) {
+      var act = -1;
+      for (var i = 0; i < items.length; i++) { if (isActiveItem(items[i].el)) { act = i; break; } }
+      if (act >= 0) {
+        var cur = items[act].t;
+        if (CHAP_RE.test(cur)) {
+          /* 当前就在章上：取该章下第一个单元名 */
+          var first = (act + 1 < items.length) ? items[act + 1].t : '';
+          return joinLoc(cur, first);
+        }
+        /* 当前在单元上：往前找最近的章 */
+        var chap = '';
+        for (var k = act - 1; k >= 0; k--) {
+          if (CHAP_RE.test(items[k].t)) { chap = items[k].t; break; }
+        }
+        if (!chap) {
+          for (var q = 0; q < items.length; q++) { if (CHAP_RE.test(items[q].t)) { chap = items[q].t; break; } }
+        }
+        return joinLoc(chap, cur);
+      }
+      /* 无高亮：找第一个“章”，并用它后面第一个单元 */
+      for (var m = 0; m < items.length; m++) {
+        if (CHAP_RE.test(items[m].t)) {
+          var nx = (m + 1 < items.length) ? items[m + 1].t : '';
+          return joinLoc(items[m].t, nx);
+        }
       }
     }
-    return best;
+    /* 回退：正文里找“第X章”，再找同容器里第一个单元行 */
+    var re = /第\s*[0-9一二三四五六七八九十百零]+\s*[章节讲单元课]\s*[^\s]{0,20}/;
+    var els = document.querySelectorAll('h1,h2,h3,h4,.chapter,.section,.unit,li,span,div,b,strong,p');
+    var best = '', bestEl = null;
+    for (var n = 0; n < els.length && n < 300; n++) {
+      var el = els[n];
+      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+      var t = cleanText(el.innerText || '');
+      if (!t || t.length > 40) continue;
+      if (re.test(t)) {
+        if (!best || t.length < best.length) { best = t; bestEl = el; }
+      }
+    }
+    if (best) {
+      var unit = '';
+      if (bestEl && bestEl.parentElement) {
+        var sib = bestEl.nextElementSibling;
+        if (sib) {
+          var st = cleanText(sib.innerText || '');
+          if (st && st.length <= 40) unit = st;
+        }
+      }
+      return joinLoc(best, unit);
+    }
+    return '';
   }
 
   /* ---------------- UI ---------------- */
@@ -693,6 +816,8 @@ var ZHR = (function () {
   var K_INDEX = 'zhr.v1.index';
   var K_UI_COURSE = 'zhr.v1.ui.course';
   var K_UI_CHAPTER = 'zhr.v1.ui.chapter';
+  var K_UI_COURSE_MANUAL = 'zhr.v1.ui.course.manual';
+  var K_UI_CHAPTER_MANUAL = 'zhr.v1.ui.chapter.manual';
   /* GM 权限缺失时降级到同源 localStorage（面板/记录仍可用；跨子域共享退化为同源） */
   function sGet(k) {
     try { if (typeof GM_getValue === 'function') return GM_getValue(k, null); } catch (e) { /* ignore */ }
@@ -1067,9 +1192,11 @@ var ZHR = (function () {
     sSet(courseKeyFor(courseName), 'null');
     var list = loadCourseList().filter(function (c) { return c.name !== courseName; });
     sSet(K_INDEX, JSON.stringify(list));
-    /* 面板记忆也一并清除，回到空白状态 */
+    /* 面板记忆也一并清除，回到自动识别状态 */
     sSet(K_UI_COURSE, '');
     sSet(K_UI_CHAPTER, '');
+    sSet(K_UI_COURSE_MANUAL, '');
+    sSet(K_UI_CHAPTER_MANUAL, '');
     var ci = uiDoc().getElementById('zhr-course-input');
     var hi = uiDoc().getElementById('zhr-chapter-input');
     if (ci) ci.value = '';
@@ -1166,7 +1293,7 @@ var ZHR = (function () {
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
-    tip.textContent = '用法：做完一章→在“成绩/查看解析”页点「开始记录」；每章点一次，自动累计。快捷键 Ctrl+Shift+X 也可记录。';
+    tip.textContent = '课程名/章节名自动识别（点进章节会更新为该章+第一个单元名），手改后以你改的为准；「清空本课」恢复自动。用法：把解析页点「开始记录」，快捷键 Ctrl+Shift+X。';
 
     var stat = document.createElement('div');
     stat.id = 'zhr-stat';
@@ -1179,16 +1306,42 @@ var ZHR = (function () {
     root.appendChild(head); root.appendChild(body);
     (udoc.body || udoc.documentElement).appendChild(root);
 
-    /* 记忆优先：有保存过就用保存值，否则用自动识别；用户改动即时保存 */
+    /* 自动识别优先：未手改时就用当前页面的识别值（点进新章节会自动更新）；
+       用户手改过则尊重手动值（存起来），只有「清空本课」会重置。 */
+    var manualCourse = sGet(K_UI_COURSE_MANUAL) === '1';
+    var manualChapter = sGet(K_UI_CHAPTER_MANUAL) === '1';
     var savedCourse = sGet(K_UI_COURSE) || '';
     var savedChapter = sGet(K_UI_CHAPTER) || '';
-    courseInput.value = savedCourse || guessCourseName();
-    chapterInput.value = savedChapter || guessChapterName();
-    if (!savedCourse && courseInput.value) sSet(K_UI_COURSE, courseInput.value);
-    if (!savedChapter && chapterInput.value) sSet(K_UI_CHAPTER, chapterInput.value);
-    courseInput.addEventListener('input', function () { sSet(K_UI_COURSE, normWs(courseInput.value)); refreshStatBar(); });
-    chapterInput.addEventListener('input', function () { sSet(K_UI_CHAPTER, normWs(chapterInput.value)); });
+    courseInput.value = manualCourse ? savedCourse : (guessCourseName() || savedCourse);
+    chapterInput.value = manualChapter ? savedChapter : (guessChapterName() || savedChapter);
+    if (!manualCourse && courseInput.value) sSet(K_UI_COURSE, courseInput.value);
+    if (!manualChapter && chapterInput.value) sSet(K_UI_CHAPTER, chapterInput.value);
+    courseInput.addEventListener('input', function () {
+      sSet(K_UI_COURSE, normWs(courseInput.value));
+      sSet(K_UI_COURSE_MANUAL, '1');
+      refreshStatBar();
+    });
+    chapterInput.addEventListener('input', function () {
+      sSet(K_UI_CHAPTER, normWs(chapterInput.value));
+      sSet(K_UI_CHAPTER_MANUAL, '1');
+    });
     refreshStatBar();
+
+    /* 页内切章节（不重载页面）时，未手改的课程名/章节名自动跟随刷新 */
+    setInterval(function () {
+      try {
+        if (document.activeElement === courseInput || document.activeElement === chapterInput) return;
+        if (sGet(K_UI_COURSE_MANUAL) !== '1') {
+          var gc = guessCourseName();
+          if (gc && gc !== courseInput.value) { courseInput.value = gc; sSet(K_UI_COURSE, gc); }
+        }
+        if (sGet(K_UI_CHAPTER_MANUAL) !== '1') {
+          var gh = guessChapterName();
+          if (gh && gh !== chapterInput.value) { chapterInput.value = gh; sSet(K_UI_CHAPTER, gh); }
+        }
+        refreshStatBar();
+      } catch (e) { /* ignore */ }
+    }, 2500);
 
     /* 拖动 */
     var dragging = false, dx = 0, dy = 0;
