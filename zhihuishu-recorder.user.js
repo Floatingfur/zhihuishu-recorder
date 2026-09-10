@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.6.0
+// @version      1.6.1
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.6.0';
+  var VERSION = '1.6.1';
 
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
@@ -356,8 +356,14 @@ var ZHR = (function () {
   var CORRECT_CLS_RE = /\b(correct|right|answer|daan|green|succ|pass|true)\w*/i;
   var MARKED_WRONG_RE = /\b(wrong|incorrect|false|error)\w*/i;
   var CONTAINER_CLS_RE = /(question|timu|topic|subject|exam|test|answer|result|choice|item)/i;
+  /* 导航/目录类容器：不是题目 */
+  var NAV_CLS_RE = /(catalog|catalogue|menu|nav|sidebar|sider|aside|breadcrumb|crumb|tree|directory|toc|tab)/i;
+  /* 按钮/图标类元素：即便 class 含 answer 也不作为“答案标记” */
+  var UI_EL_RE = /(btn|button|icon|toolbar|ai-|advert|avatar|logo)/i;
   /* 答题卡/答案汇总区：不能被当成题目记录 */
   var CARD_RE = /(答题卡|答案卡|答题情况|答案汇总|全部答案|答案速览|答题记录|答案列表|答案一览)/;
+  /* 标题/课程信息类文本：无选项且无答案时不当题目 */
+  var NOISE_RE = /(学年|学期|智慧树|知到|精品课程|课程介绍|学习进度|课程中心|我的课程|目录|导航|题库总览)/;
 
   function splitLines(t) {
     return String(t || '').split(/\r?\n/).map(function (s) { return normWs(s); }).filter(Boolean);
@@ -371,13 +377,20 @@ var ZHR = (function () {
 
   function innerTextOf(el) { return (el.innerText || el.textContent || ''); }
 
+  function markerByClass(el) {
+    var c = clsOf(el);
+    if (!c || !CORRECT_CLS_RE.test(c)) return false;
+    if (UI_EL_RE.test(c)) return false;              /* 按钮/图标不算答案标记 */
+    return true;
+  }
+
   function hasAnswerMarker(el) {
     var t = innerTextOf(el);
     if (ANSWER_LINE_RE.test(t)) return true;
-    if (CORRECT_CLS_RE.test(clsOf(el))) return true;
+    if (markerByClass(el)) return true;
     var marked = el.querySelectorAll('[class]');
     for (var i = 0; i < marked.length && i < 200; i++) {
-      if (CORRECT_CLS_RE.test(clsOf(marked[i]))) return true;
+      if (markerByClass(marked[i])) return true;
     }
     return false;
   }
@@ -391,6 +404,7 @@ var ZHR = (function () {
       if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
       var idc = el.id || '';
       var clsc = clsOf(el);
+      if (NAV_CLS_RE.test(clsc) || NAV_CLS_RE.test(idc)) continue;   /* 导航/目录类不算题目 */
       if (!(CONTAINER_CLS_RE.test(idc) || CONTAINER_CLS_RE.test(clsc))) continue;
       var txt = innerTextOf(el);
       if (txt.length < 8 || txt.length > 20000) continue;
@@ -424,6 +438,17 @@ var ZHR = (function () {
     var stem = (parsed && parsed.stem) || '';
     if (/^(答题卡|答案卡|答案汇总|全部答案|答题情况)/.test(stem)) return true;
     if ((stem.match(/\d{1,3}\s*[.、．]/g) || []).length >= 3) return true;
+    return false;
+  }
+
+  /* 标题/导航/空壳块：既无选项又无答案的，不当题目记录 */
+  function looksLikeNoise(container, q) {
+    var stem = (q && q.stem) || '';
+    var hasOpts = !!(q && q.options && q.options.length);
+    var hasAns = !!(q && q.answer);
+    if (!hasOpts && !hasAns) return true;                 /* 不可作答的空壳 */
+    if (!hasOpts && NOISE_RE.test(stem) && stem.length <= 40) return true;  /* 课程/学期标题 */
+    if (cleanText(stem).length < 2) return true;          /* 题干过短 */
     return false;
   }
 
@@ -907,12 +932,13 @@ var ZHR = (function () {
     }
 
     var incoming = [];
-    var failed = 0, cardSkipped = 0;
+    var failed = 0, cardSkipped = 0, noiseSkipped = 0;
     for (var i = 0; i < containers.length; i++) {
       try {
         var q = parseQuestion(containers[i], chapterName);
         if (!q.stem) { failed++; continue; }
         if (looksLikeAnswerCard(containers[i], q)) { cardSkipped++; continue; }
+        if (looksLikeNoise(containers[i], q)) { noiseSkipped++; continue; }
         incoming.push(q);
       } catch (err) { failed++; }
     }
@@ -927,7 +953,7 @@ var ZHR = (function () {
     saveCourse(courseName, course);
     var totalAll = course.questions.length;
 
-    if (!silent) toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题' + (cardSkipped ? '，跳过答题卡 ' + cardSkipped + ' 块' : '') + '；该课累计 ' + totalAll + ' 题');
+    if (!silent) toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题' + (cardSkipped ? '，跳过答题卡 ' + cardSkipped + ' 块' : '') + (noiseSkipped ? '，跳过标题/无效块 ' + noiseSkipped + ' 块' : '') + '；该课累计 ' + totalAll + ' 题');
     refreshStatBar();
     return { ok: true, added: res.added.length, variants: res.variants.length, skipped: res.skipped, failed: failed, totalAll: totalAll };
   }
@@ -1144,6 +1170,7 @@ var ZHR = (function () {
       try { parsed = parseQuestion(c, ''); } catch (e) { parsed = { err: e.message }; }
       if (parsed.err) out.push('      parseErr: ' + parsed.err);
       else if (looksLikeAnswerCard(c, parsed)) out.push('      → 判定为答题卡/无效块（将被跳过）');
+      else if (looksLikeNoise(c, parsed)) out.push('      → 判定为标题/导航/空壳块（将被跳过）');
       else out.push('      stem=' + (parsed.stem || '').slice(0, 60) + ' | type=' + parsed.type + ' | opts=' + parsed.options.length + ' | ans=' + (parsed.answer || '').slice(0, 40));
     }
 
