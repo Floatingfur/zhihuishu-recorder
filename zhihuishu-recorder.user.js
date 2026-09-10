@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.7.4
+// @version      1.7.5
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -935,21 +935,55 @@ var ZHR = (function () {
   /* ---------------- 核心动作 ---------------- */
 
   /* 面板状态记忆：课程名/章节名持久化，切换界面（页面重载）后自动恢复；
-     只有点「清空本课」才清除。 */
+     只有点「清空本课」才清除。
+     重要：课程名是题库的键，识别波动会导致"看上去记录被清空"，
+     所以这里加了锚点规则（见 resolveCourseName），绝不会因为识别到别的名字就换库。 */
+  var COURSE_HINT = '';
+
+  /* 某门课已有多少题（用于"有记录的课程优先"） */
+  function courseRecordsCount(name) {
+    if (!name) return 0;
+    var c = null;
+    try { c = loadCourse(name); } catch (e) { return 0; }
+    return c && c.questions ? c.questions.length : 0;
+  }
+
+  /* 其它课程里的记录概览（当前课为空时提示用户记录在哪） */
+  function otherCoursesText(exceptName) {
+    var list = loadCourseList();
+    var parts = [];
+    for (var i = 0; i < list.length && parts.length < 4; i++) {
+      if (list[i].name === exceptName) continue;
+      var n = courseRecordsCount(list[i].name);
+      if (n) parts.push(list[i].name + '(' + n + '题)');
+    }
+    return parts.join('、');
+  }
+
   function statText() {
-    var c = loadCourse(currentCourseGuess());
-    if (!c || !c.questions.length) return '本课暂无记录（做完一章在解析页点「开始记录」）';
+    var name = currentCourseGuess();
+    var c = loadCourse(name);
+    var hint = COURSE_HINT ? '　⚠ ' + COURSE_HINT : '';
+    if (!c || !c.questions.length) {
+      var others = otherCoursesText(name);
+      return '本课暂无记录（做完一章在解析页点「开始记录」）' + (others ? '；其它课程：' + others : '') + hint;
+    }
     var chs = {};
     c.questions.forEach(function (q) { chs[q.chapter || '未命名章节'] = 1; });
-    return '本课已记录 ' + c.questions.length + ' 题，覆盖 ' + Object.keys(chs).length + ' 个章节';
+    return '本课已记录 ' + c.questions.length + ' 题，覆盖 ' + Object.keys(chs).length + ' 个章节' + hint;
   }
   function refreshStatBar() {
     var el = uiDoc().getElementById('zhr-stat');
     if (el) el.textContent = statText();
   }
   function recordedText() {
-    var c = loadCourse(currentCourseGuess());
-    if (!c || !c.questions.length) return '（本课暂无记录）\n做完一章、进入「本次成绩/查看解析」页后点「▶ 开始记录」即可累积。';
+    var cur = currentCourseGuess();
+    var c = loadCourse(cur);
+    if (!c || !c.questions.length) {
+      var others = otherCoursesText(cur);
+      return '（本课暂无记录）\n做完一章、进入「本次成绩/查看解析」页后点「▶ 开始记录」即可累积。' +
+        (others ? '\n\n其它课程里已有记录：' + others + '\n（把上面的课程名框改成对应课程名即可查看/导出）' : '');
+    }
     var doc = coursesToDoc(c);
     var out = [];
     out.push('课程：' + (c.name || '未命名课程') + '　合计 ' + c.questions.length + ' 题');
@@ -965,9 +999,40 @@ var ZHR = (function () {
     return out.join('\n');
   }
 
-  function currentCourseGuess() {
+  /* 课程名识别带缓存（resolveCourseName 会被频繁调用） */
+  var GUESS_CACHE = { t: 0, v: '' };
+  function guessCourseNameCached() {
+    var now = Date.now();
+    if (now - GUESS_CACHE.t < 1200) return GUESS_CACHE.v;
+    var v = '';
+    try { v = guessCourseName() || ''; } catch (e) { v = ''; }
+    GUESS_CACHE = { t: now, v: v };
+    return v;
+  }
+
+  /* 课程名解析规则（关键：绝不因为识别波动就把记录换个地方）
+     1) 手改过 → 以手改为准；
+     2) 识别到含「学年/学期」的名字（课程名典型形态）→ 直接采用；
+     3) 否则优先"已有记录"的那个课程名 → 防止切页后看起来记录被清空；
+     4) 都没有 → 用识别值（次选记忆值）。 */
+  function resolveCourseName() {
+    var manual = sGet(K_UI_COURSE_MANUAL) === '1';
+    var saved = sGet(K_UI_COURSE) || '';
     var inp = uiDoc().getElementById('zhr-course-input');
-    return normWs(inp ? inp.value : '') || guessCourseName();
+    var typed = normWs(inp ? inp.value : '');
+    if (manual) return typed || saved;
+    var guess = guessCourseNameCached();
+    if (/(学年|学期)/.test(guess)) return guess;
+    if (typed && courseRecordsCount(typed)) return typed;
+    if (saved && courseRecordsCount(saved)) return saved;
+    return guess || typed || saved;
+  }
+
+  function currentCourseGuess() {
+    var n = resolveCourseName();
+    if (n) return n;
+    var inp = uiDoc().getElementById('zhr-course-input');
+    return normWs(inp ? inp.value : '') || guessCourseNameCached();
   }
 
   function doRecord(silent, presetContainers) {
@@ -1021,7 +1086,7 @@ var ZHR = (function () {
   var BTN_SECTION_RE = /(下一节|下一个|下一章|下一课|下一讲|下一个视频|继续学习)/;
   var CLOSE_SIG_RE = /(close|exit|back|关闭|退出|返回)/i;
 
-  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, catalogCache: null, videoDone: false, catalogExhausted: false, switchFails: 0, lastAction: '', sameAction: 0 };
+  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, catalogCache: null, videoDone: false, catalogExhausted: false, switchFails: 0, entered: false, viewClicked: false, boostIdle: 0, lastAction: '', sameAction: 0 };
 
   function pilotLog(msg) {
     PILOT.logs.push(new Date().toLocaleTimeString('zh-CN') + ' ' + msg);
@@ -1129,6 +1194,32 @@ var ZHR = (function () {
     return null;
   }
 
+  /* 宽松兜底：带“答案”行、体积不大、非导航/答题卡的块（智慧树「查看解析」后常见） */
+  function looseContainers(doc) {
+    var all;
+    try { all = doc.querySelectorAll('div,li,section'); } catch (e) { return []; }
+    var cands = [];
+    var n = Math.min(all.length, 8000);
+    for (var i = 0; i < n; i++) {
+      var el = all[i];
+      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+      var c = clsOf(el), idc = el.id || '';
+      if (NAV_CLS_RE.test(c) || NAV_CLS_RE.test(idc)) continue;
+      var t = innerTextOf(el);
+      if (t.length < 8 || t.length > 6000) continue;
+      if (!ANSWER_LINE_RE.test(t)) continue;
+      if (CARD_RE.test(normWs(t).slice(0, 80))) continue;
+      cands.push(el);
+    }
+    /* 取最内层（去掉包含其它候选的父块） */
+    return cands.filter(function (a) {
+      for (var j = 0; j < cands.length; j++) {
+        if (cands[j] !== a && a.contains(cands[j])) return false;
+      }
+      return true;
+    });
+  }
+
   /* 只取“屏幕上可见、且解析出真正题目”的容器（含同源 iframe）；
      空壳/标题/答题卡不算，避免在视频页被误当成“题目页” */
   function pilotContainers() {
@@ -1136,7 +1227,9 @@ var ZHR = (function () {
     var out = [];
     for (var d = 0; d < docs.length; d++) {
       var all = [];
+      var loose = false;
       try { all = findQuestionContainers(docs[d]); } catch (e) { all = []; }
+      if (!all.length) { loose = true; all = looseContainers(docs[d]); }
       for (var i = 0; i < all.length; i++) {
         var el = all[i];
         if (!pilotVisible(el)) continue;
@@ -1145,6 +1238,8 @@ var ZHR = (function () {
         if (!p || !p.stem) continue;
         if (looksLikeAnswerCard(el, p)) continue;
         if (looksLikeNoise(el, p)) continue;
+        /* 宽松通道额外要求：至少像一道题（有选项 或 判断/填空） */
+        if (loose && !(p.options.length >= 2 || p.type === 'judge' || p.type === 'fill')) continue;
         out.push(el);
       }
     }
@@ -1297,23 +1392,27 @@ var ZHR = (function () {
     if (!PILOT.running) return;
     if (++PILOT.steps > PILOT.maxSteps) { pilotStop('已达步数上限'); return; }
 
-    /* 1) 本页有可见题目 → 读取（一个视频只进一次提升） */
+    /* 1) 本页有可见题目（已展开答案）→ 读取（一个视频只进一次提升） */
     var conts = pilotContainers();
     if (conts.length) {
       var r = doRecord(true, conts) || {};
       var added = r.added || 0;
       pilotLog('读取本页：新增 ' + added + ' 题');
       PILOT.idle = 0;
+      PILOT.viewClicked = false;          /* 下一题可能要再点一次「查看解析」 */
       if (added > 0) {
         PILOT.lastAction = '';
         PILOT.sameAction = 0;
         var nx = pilotClick(BTN_NEXT_RE, 16);
         if (nx) { pilotLog('→ 下一题（' + nx + '）'); return; }
       }
-      /* 读完（或全是重复）→ 退出；本视频不再重复进入 */
+      /* 读完（或全是重复）→ 退出，回到视频页；本视频不再重复进入 */
       var ex = pilotClick(BTN_EXIT_RE, 20) || pilotClickIcon(CLOSE_SIG_RE);
       if (ex) {
         PILOT.videoDone = true;
+        PILOT.entered = false;
+        PILOT.viewClicked = false;
+        PILOT.boostIdle = 0;
         pilotLog('→ 退出（' + ex + '），本视频完成，接着切下一个');
         return;
       }
@@ -1336,13 +1435,45 @@ var ZHR = (function () {
       if (PILOT.switchFails >= 2) { pilotStop('连续两次无法切到下一个视频，已停止以免重复进入同一视频'); return; }
     }
 
-    /* 3) 打开解析 */
-    var v = pilotClick(BTN_VIEW_RE, 16);
-    if (v) { PILOT.idle = 0; pilotLog('→ 查看解析（' + v + '）'); return; }
+    /* 3) 已经进了提升/练习界面 → 必须先点「查看解析」才能看到答案（智慧树顺序） */
+    if (PILOT.entered && !PILOT.viewClicked) {
+      var v = pilotClick(BTN_VIEW_RE, 20);
+      if (v) {
+        PILOT.idle = 0;
+        PILOT.boostIdle = 0;
+        PILOT.viewClicked = true;
+        pilotLog('→ 查看解析（' + v + '）');
+        return;
+      }
+    }
 
-    /* 4) 进入提升 */
-    var en = pilotClick(BTN_ENTRY_RE, 16);
-    if (en) { PILOT.idle = 0; pilotLog('→ 进入（' + en + '）'); return; }
+    /* 4) 进入提升（未进入时） */
+    var en = pilotClick(BTN_ENTRY_RE, 20);
+    if (en) {
+      PILOT.idle = 0;
+      PILOT.entered = true;
+      PILOT.viewClicked = false;
+      PILOT.boostIdle = 0;
+      pilotLog('→ 进入（' + en + '），接着点「查看解析」');
+      return;
+    }
+
+    /* 4b) 已进入却既没题目也点不到解析 → 试着退出来，换下一个，别卡死在里面 */
+    if (PILOT.entered) {
+      PILOT.boostIdle = (PILOT.boostIdle || 0) + 1;
+      pilotLog('已进入提升，但未发现题目/「查看解析」（' + PILOT.boostIdle + '/4）');
+      if (PILOT.boostIdle >= 4) {
+        var back = pilotClick(BTN_EXIT_RE, 20) || pilotClickIcon(CLOSE_SIG_RE);
+        PILOT.entered = false;
+        PILOT.viewClicked = false;
+        PILOT.boostIdle = 0;
+        if (back) {
+          PILOT.videoDone = true;
+          pilotLog('→ 退出（' + back + '），换下一个视频');
+          return;
+        }
+      }
+    }
 
     /* 5) 切下一个目录项 */
     var n2 = pilotNextCatalog();
@@ -1364,6 +1495,9 @@ var ZHR = (function () {
     PILOT.videoDone = false;
     PILOT.catalogExhausted = false;
     PILOT.switchFails = 0;
+    PILOT.entered = false;
+    PILOT.viewClicked = false;
+    PILOT.boostIdle = 0;
     PILOT.lastAction = '';
     PILOT.sameAction = 0;
     pilotLog('开始自动遍历（不答题、不提交）');
@@ -1621,7 +1755,7 @@ var ZHR = (function () {
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
-    tip.textContent = '课程名/章节名自动识别（点进章节会更新为该章+第一个单元名），手改后以你改的为准；「清空本课」恢复自动。用法：把解析页点「开始记录」，快捷键 Ctrl+Shift+X。「⏭ 下一个（测试）」可手动切下一个视频。';
+    tip.textContent = '自动遍历顺序：去提升 → 查看解析 → 读取 → 退出 → 切下一个视频。课程名/章节名自动识别，手改后以你改的为准；记录只在点「清空本课」时清除，换页面/切章节都不会丢。';
 
     var stat = document.createElement('div');
     stat.id = 'zhr-stat';
@@ -1640,7 +1774,9 @@ var ZHR = (function () {
     var manualChapter = sGet(K_UI_CHAPTER_MANUAL) === '1';
     var savedCourse = sGet(K_UI_COURSE) || '';
     var savedChapter = sGet(K_UI_CHAPTER) || '';
-    courseInput.value = manualCourse ? savedCourse : (guessCourseName() || savedCourse);
+    /* 有记录的记忆课程名优先：避免这次识别波动 → 看上去"记录被清空" */
+    var initCourse = (savedCourse && courseRecordsCount(savedCourse)) ? savedCourse : (guessCourseNameCached() || savedCourse);
+    courseInput.value = manualCourse ? (savedCourse || initCourse) : initCourse;
     chapterInput.value = manualChapter ? savedChapter : (guessChapterName() || savedChapter);
     if (!manualCourse && courseInput.value) sSet(K_UI_COURSE, courseInput.value);
     if (!manualChapter && chapterInput.value) sSet(K_UI_CHAPTER, chapterInput.value);
@@ -1655,13 +1791,20 @@ var ZHR = (function () {
     });
     refreshStatBar();
 
-    /* 页内切章节（不重载页面）时，未手改的课程名/章节名自动跟随刷新 */
+    /* 页内切章节（不重载页面）时，未手改的课程名/章节名自动跟随刷新；
+       课程名走锚点规则：识别到的新名字若没记录，不会把当前有记录的库换掉 */
     setInterval(function () {
       try {
-        if (document.activeElement === courseInput || document.activeElement === chapterInput) return;
+        if (document.activeElement === courseInput || document.activeElement === chapterInput) { refreshStatBar(); return; }
         if (sGet(K_UI_COURSE_MANUAL) !== '1') {
           var gc = guessCourseName();
-          if (gc && gc !== courseInput.value) { courseInput.value = gc; sSet(K_UI_COURSE, gc); }
+          var keep = resolveCourseName();
+          COURSE_HINT = '';
+          if (gc && keep && gc !== keep) COURSE_HINT = '识别到「' + gc + '」但它没有记录，已保持当前课程；要切换请直接改上面的课程名框';
+          if (keep && keep !== courseInput.value) { courseInput.value = keep; sSet(K_UI_COURSE, keep); }
+          else if (!keep && gc) { courseInput.value = gc; sSet(K_UI_COURSE, gc); }
+        } else {
+          COURSE_HINT = '';
         }
         if (sGet(K_UI_CHAPTER_MANUAL) !== '1') {
           var gh = guessChapterName();
