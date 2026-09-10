@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.8.0
+// @version      1.8.1
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.8.0';
+  var VERSION = '1.8.1';
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
   function collectErr(ev) {
@@ -1172,13 +1172,29 @@ var ZHR = (function () {
   var BTN_SECTION_RE = /(下一节|下一个|下一章|下一课|下一讲|下一个视频|继续学习)/;
   var CLOSE_SIG_RE = /(close|exit|back|关闭|退出|返回)/i;
 
-  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, catalogCache: null, videoDone: false, catalogExhausted: false, switchFails: 0, entered: false, viewClicked: false, boostIdle: 0, lastAction: '', sameAction: 0 };
+  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, noop: 0, catalogIdx: null, catalogCache: null, videoDone: false, catalogExhausted: false, switchFails: 0, entered: false, viewClicked: false, boostIdle: 0, stuckSkip: false, lastAction: '', sameAction: 0 };
+
+  /* 自动遍历状态持久化：点“下一节/下一个视频”常会整页刷新，
+     刷新后脚本重建，运行状态丢了就会“断”。存下来就能自动续跑。 */
+  var K_PILOT = 'zhr.pilot.auto';
+  function pilotSaveState() {
+    try {
+      sSet(K_PILOT, JSON.stringify({
+        on: 1,
+        idx: (typeof PILOT.catalogIdx === 'number') ? PILOT.catalogIdx : null,
+        videoDone: !!PILOT.videoDone,
+        t: Date.now(),
+        logs: PILOT.logs.slice(-10)
+      }));
+    } catch (e) { /* ignore */ }
+  }
 
   function pilotLog(msg) {
     PILOT.logs.push(new Date().toLocaleTimeString('zh-CN') + ' ' + msg);
     if (PILOT.logs.length > 30) PILOT.logs.shift();
     var el = uiDoc().getElementById('zhr-pilotlog');
     if (el) el.textContent = PILOT.logs.slice(-3).join('\n');
+    if (PILOT.running) pilotSaveState();      /* 心跳：刷新后能续跑 */
   }
 
   /* 当前文档 + 同源 iframe 文档（“去提升/退出”按钮与题目常在 iframe 里） */
@@ -1248,10 +1264,16 @@ var ZHR = (function () {
     var hit = pilotFind(re, maxLen);
     if (!hit) return null;
     pilotFireClick(hit.el);
-    /* 同一按钮反复点但页面没进展 → 自动停，避免无效循环 */
+    PILOT.noop = 0;
+    /* 同一按钮反复点但页面没进展 → 不再停止整个遍历，改为“放弃这个视频、跳下一个” */
     if (PILOT.lastAction === hit.text) PILOT.sameAction = (PILOT.sameAction || 0) + 1;
     else { PILOT.lastAction = hit.text; PILOT.sameAction = 1; }
-    if (PILOT.sameAction >= 8) pilotStop('同一按钮连续 8 次无效：' + hit.text);
+    if (PILOT.sameAction >= 8) {
+      PILOT.sameAction = 0;
+      PILOT.lastAction = '';
+      PILOT.stuckSkip = true;
+      pilotLog('「' + hit.text + '」连点 8 次无效 → 放弃这个视频，切下一个');
+    }
     return hit.text;
   }
 
@@ -1470,6 +1492,8 @@ var ZHR = (function () {
     var t = normWs(el.innerText || '');
     PILOT.catalogIdx = next;
     PILOT.catalogExhausted = false;
+    PILOT.noop = 0;
+    pilotSaveState();          /* 点之前先存状态：点完可能整页刷新 */
     pilotClickItem(el);
     return t.slice(0, 24);
   }
@@ -1478,9 +1502,19 @@ var ZHR = (function () {
     if (!PILOT.running) return;
     if (++PILOT.steps > PILOT.maxSteps) { pilotStop('已达步数上限'); return; }
 
+    /* 0) 上个视频点不动 → 借道“切下一个”逻辑跳过，继续往下跑（不停止） */
+    if (PILOT.stuckSkip) {
+      PILOT.stuckSkip = false;
+      PILOT.entered = false;
+      PILOT.viewClicked = false;
+      PILOT.boostIdle = 0;
+      PILOT.videoDone = true;
+    }
+
     /* 1) 本页有可见题目（已展开答案）→ 读取（一个视频只进一次提升） */
     var conts = pilotContainers();
     if (conts.length) {
+      PILOT.noop = 0;
       var r = doRecord(true, conts) || {};
       var added = r.added || 0;
       pilotLog('读取本页：新增 ' + added + ' 题');
@@ -1510,15 +1544,31 @@ var ZHR = (function () {
 
     /* 2) 刚退出上一个提升 → 先切下一个视频/节点，再继续点它的「去提升」 */
     if (PILOT.videoDone) {
-      PILOT.videoDone = false;
       var n0 = pilotNextCatalog();
-      if (n0) { PILOT.idle = 0; PILOT.switchFails = 0; pilotLog('→ 下一个视频/节点（' + n0 + '）'); return; }
+      if (n0) {
+        PILOT.videoDone = false;
+        PILOT.idle = 0;
+        PILOT.switchFails = 0;
+        pilotLog('→ 下一个视频/节点（' + n0 + '）');
+        return;
+      }
       var ns = pilotClick(BTN_SECTION_RE, 20);          /* 兔底：页面上的“下一节/下一个”按钮 */
-      if (ns) { PILOT.idle = 0; PILOT.switchFails = 0; pilotLog('→ 下一节（' + ns + '）'); return; }
+      if (ns) {
+        PILOT.videoDone = false;
+        PILOT.idle = 0;
+        PILOT.switchFails = 0;
+        pilotLog('→ 下一节（' + ns + '）');
+        return;
+      }
       if (PILOT.catalogExhausted) { pilotStop('已遍历完课程（最后一个视频已完成）'); return; }
+      /* 切不到就继续重试（不停止、也不回同一个视频里反复进出） */
       PILOT.switchFails = (PILOT.switchFails || 0) + 1;
-      pilotLog('未识别到目录/下一节按钮，无法自动切下一个（' + pilotCatalogStats() + '）');
-      if (PILOT.switchFails >= 2) { pilotStop('连续两次无法切到下一个视频，已停止以免重复进入同一视频'); return; }
+      PILOT.catalogCache = null;                        /* 清缓存，下轮重新识别目录 */
+      if (PILOT.switchFails % 3 === 1) {
+        pilotLog('切不到下一个（第 ' + PILOT.switchFails + ' 次，' + pilotCatalogStats() + '），继续重试…');
+      }
+      if (PILOT.switchFails >= 20) { pilotStop('连续 20 次无法切到下一个视频，已停止'); return; }
+      return;
     }
 
     /* 3) 已经进了提升/练习界面 → 必须先点「查看解析」才能看到答案（智慧树顺序） */
@@ -1565,31 +1615,46 @@ var ZHR = (function () {
     var n2 = pilotNextCatalog();
     if (n2) { PILOT.idle = 0; pilotLog('→ 下个视频/节点（' + n2 + '）'); return; }
 
+    /* 6) 真的找不到可操作项：先试着跳过这个视频，连续多次才停 */
     PILOT.idle = (PILOT.idle || 0) + 1;
+    PILOT.noop = (PILOT.noop || 0) + 1;
     pilotLog('未找到可操作项（' + PILOT.idle + '/3）');
-    if (PILOT.idle >= 3) pilotStop('连续未找到可操作项');
+    if (PILOT.idle >= 3) {
+      PILOT.idle = 0;
+      PILOT.catalogCache = null;
+      if (PILOT.catalogExhausted) { pilotStop('已遍历完课程（最后一个视频已完成）'); return; }
+      var sk = pilotNextCatalog();
+      if (sk) { pilotLog('→ 跳过，切下一个节点（' + sk + '）'); return; }
+    }
+    if (PILOT.noop >= 24) pilotStop('连续 24 次找不到可操作项，已停止');
   }
 
-  function pilotStart() {
+  function pilotStart(resume) {
     if (PILOT.running) return;
     PILOT.running = true;
     PILOT.steps = 0;
-    PILOT.logs = [];
+    if (!resume) {
+      PILOT.logs = [];
+      PILOT.catalogIdx = null;
+      PILOT.videoDone = false;
+    }
     PILOT.idle = 0;
-    PILOT.catalogIdx = null;
+    PILOT.noop = 0;
     PILOT.catalogCache = null;
-    PILOT.videoDone = false;
     PILOT.catalogExhausted = false;
     PILOT.switchFails = 0;
     PILOT.entered = false;
     PILOT.viewClicked = false;
     PILOT.boostIdle = 0;
+    PILOT.stuckSkip = false;
     PILOT.lastAction = '';
     PILOT.sameAction = 0;
-    pilotLog('开始自动遍历（不答题、不提交）');
+    pilotLog(resume ? '继续自动遍历（上次因页面跳转中断，已自动续跑）' : '开始自动遍历（不答题、不提交）');
     var b = uiDoc().getElementById('zhr-b6');
     if (b) b.textContent = '⏹ 停止遍历';
+    if (PILOT.timer) clearInterval(PILOT.timer);
     PILOT.timer = setInterval(pilotStep, 1600);
+    pilotSaveState();
   }
   function pilotStop(reason) {
     PILOT.running = false;
@@ -1597,6 +1662,7 @@ var ZHR = (function () {
     pilotLog('已停止' + (reason ? '：' + reason : ''));
     var b = uiDoc().getElementById('zhr-b6');
     if (b) b.textContent = '🤖 自动遍历';
+    try { sSet(K_PILOT, ''); } catch (e) { /* ignore */ }   /* 清掉续跑标记 */
     refreshStatBar();
   }
   function pilotToggle() { if (PILOT.running) pilotStop(''); else pilotStart(); }
@@ -1848,7 +1914,7 @@ var ZHR = (function () {
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
-    tip.textContent = '自动遍历顺序：去提升 → 查看解析 → 读取 → 退出 → 切下一个视频。题目全部存在同一个题库里（课程名/章节名只是标签），换视频、换页面都不会丢；只有点「清空本课」才会删。';
+    tip.textContent = '自动遍历顺序：去提升 → 查看解析 → 读取 → 退出 → 切下一个视频；页面跳转（整页刷新）会自动续跑，卡住会跳过继续跑（只在你点「⏹ 停止」或课程跑完时才停）。题目全部存在同一个题库里（课程名/章节名只是标签），只有点「清空本课」才会删。';
 
     var stat = document.createElement('div');
     stat.id = 'zhr-stat';
@@ -1944,6 +2010,22 @@ var ZHR = (function () {
       if (!chapterInput.value) { chapterInput.value = guessChapterName(); if (chapterInput.value) sSet(K_UI_CHAPTER, chapterInput.value); }
       refreshStatBar();
     }, 1500);
+
+    /* 自动续跑：上次正在自动遍历，但点“下一节/下一个视频”把页面整页刷新了 → 接着跑，不要断 */
+    try {
+      var st = JSON.parse(sGet(K_PILOT) || 'null');
+      if (st && st.on) {
+        if (st.t && (Date.now() - st.t) < 120000) {
+          PILOT.logs = (st.logs || []).slice(-10);
+          PILOT.catalogIdx = (typeof st.idx === 'number') ? st.idx : null;
+          PILOT.videoDone = !!st.videoDone;
+          pilotLog('检测到上次的自动遍历，正在续跑…');
+          setTimeout(function () { pilotStart(true); }, 1200);
+        } else {
+          sSet(K_PILOT, '');        /* 太久之前（>2 分钟）的标记不再自动续跑 */
+        }
+      }
+    } catch (e0) { /* ignore */ }
   }
 
   return {
