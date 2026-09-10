@@ -122,5 +122,36 @@ ok('判断：裸“对/错”也能识别为选项', () => assert.strictEqual(p2
 ok('判断：题干干净', () => assert.strictEqual(p2.stem, 'Jennie complained of painful urination. The medical term for this is hematuria. ( )'));
 ok('判断：题型 judge', () => assert.strictEqual(Z.typeOf(p2.stem, p2.options, 2, 0), 'judge'));
 
+/* 选项内容读取（v1.8.2 修复：真机上选项字母与文字常分行/无标点） */
+console.log('== 选项内容读取（分行 / 无标点 / 一行多个） ==');
+const o1 = Z.parseLines('单选\n题\n1. 线性表的地址（ ）\nA\n连续\nB\n不连续\nC\n部分连续\nD\n均有可能\n回答正确✓\n参考答案：A');
+ok('字母一行、文字下一行 → 4 个选项都读到文字', () => {
+  assert.strictEqual(o1.stem, '线性表的地址（ ）');
+  assert.strictEqual(o1.options.length, 4);
+  assert.strictEqual(o1.options.map(o => o.letter).join(''), 'ABCD');
+  assert.strictEqual(o1.options.map(o => o.text).join('/'), '连续/不连续/部分连续/均有可能');
+});
+
+const o2 = Z.parseLines('1. 栈的特点（ ）\nA 后进先出\nB 先进先出\nC 随机存取\nD 顺序存取\n答案：A');
+ok('字母+文字（无标点）→ 选项文字读到', () => {
+  assert.strictEqual(o2.stem, '栈的特点（ ）');
+  assert.strictEqual(o2.options.length, 4);
+  assert.strictEqual(o2.options.map(o => o.text).join('/'), '后进先出/先进先出/随机存取/顺序存取');
+});
+
+const o3 = Z.parseLines('1. 队列的特点（ ）\nA. 先进先出    B. 后进先出    C. 随机    D. 顺序\n答案：A');
+ok('一行塞多个选项 → 自动拆开', () => {
+  assert.strictEqual(o3.stem, '队列的特点（ ）');
+  assert.strictEqual(o3.options.length, 4);
+  assert.strictEqual(o3.options.map(o => o.text).join('/'), '先进先出/后进先出/随机/顺序');
+});
+
+const o4 = Z.parseLines('1. A study shows the sky is blue.（ ）\n对\n错\n参考答案：对');
+ok('题干以“A ”开头（英文）→ 不被误认成选项', () => {
+  assert.strictEqual(o4.stem, 'A study shows the sky is blue.（ ）');
+  assert.strictEqual(o4.options.length, 2);
+  assert.strictEqual(o4.options.map(o => o.text).join('/'), '对/错');
+});
+
 console.log(passed + ' 项通过');
 if (process.exitCode) { console.error('存在失败用例'); }
