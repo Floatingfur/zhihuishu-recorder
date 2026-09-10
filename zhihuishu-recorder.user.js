@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.2.0
-// @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。纯本地运行，不联网、不自动答题。
+// @version      1.4.0
+// @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察与运行错误收集，点「诊断」一键出报告。纯本地运行，不联网、不自动答题。
 // @author       you
 // @match        https://*.zhihuishu.com/*
 // @match        http://*.zhihuishu.com/*
@@ -23,7 +23,24 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.2.0';
+  var VERSION = '1.4.0';
+
+  /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
+  var ERRORS = [];
+  function collectErr(ev) {
+    try {
+      var msg = ev && (ev.message || (ev.reason && ev.reason.message) || ev.reason) || 'unknown error';
+      var tag = (ev && ev.filename) || (ev && ev.target && ev.target.nodeName) || '';
+      var line = new Date().toLocaleTimeString('zh-CN') + '  ' + String(msg).slice(0, 260) + (tag && ev.lineno ? '  @' + tag + ':' + ev.lineno : (tag ? '  @' + tag : ''));
+      if (ERRORS.indexOf(line) < 0) { ERRORS.push(line); if (ERRORS.length > 30) ERRORS.shift(); }
+    } catch (x) { /* ignore */ }
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    try {
+      window.addEventListener('error', collectErr);
+      window.addEventListener('unhandledrejection', collectErr);
+    } catch (x2) { /* ignore */ }
+  }
 
   /* ---------------- 基础工具（纯函数） ---------------- */
 
@@ -369,6 +386,7 @@ var ZHR = (function () {
     var cands = [];
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
+      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
       var idc = el.id || '';
       var clsc = clsOf(el);
       if (!(CONTAINER_CLS_RE.test(idc) || CONTAINER_CLS_RE.test(clsc))) continue;
@@ -529,7 +547,7 @@ var ZHR = (function () {
     var best = '';
     for (var i = 0; i < els.length && i < 200; i++) {
       var el = els[i];
-      if (el.closest && el.closest('#zhr-root')) continue;
+      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
       var t = normWs(el.innerText || '');
       if (!t || t.length > 60) continue;
       if (re.test(t)) {
@@ -542,7 +560,7 @@ var ZHR = (function () {
   /* ---------------- UI ---------------- */
 
   function toast(msg, isError) {
-    var wrap = document.getElementById('zhr-root');
+    var wrap = uiDoc().getElementById('zhr-root');
     if (!wrap) return;
     var t = document.createElement('div');
     t.textContent = msg;
@@ -553,6 +571,27 @@ var ZHR = (function () {
       t.style.opacity = '0';
       setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 450);
     }, 3800);
+  }
+
+  /* 弹窗挂到“最顶层可访问的文档”：智慧树学习页是多层 iframe，
+     若把弹窗留在小 iframe 内，会看不见、或被随页面重建一起清掉。同源时提升到顶层窗口。 */
+  function uiDoc() {
+    var w = window;
+    for (;;) {
+      var p = null;
+      try { p = w.parent; } catch (e) { break; }
+      if (!p || p === w) break;
+      var ok = false;
+      try { ok = !!(p.document && p.document.documentElement); } catch (e2) { ok = false; }
+      if (!ok) break;
+      w = p;
+    }
+    try { return w.document; } catch (e3) { return document; }
+  }
+  function uiAttach(el) {
+    var d = uiDoc();
+    (d.body || d.documentElement).appendChild(el);
+    return d;
   }
 
   function showModal(title, bodyHtml, textareaValue) {
@@ -591,7 +630,7 @@ var ZHR = (function () {
       });
     }
     panel.appendChild(head); panel.appendChild(body); panel.appendChild(foot); mask.appendChild(panel);
-    document.documentElement.appendChild(mask);
+    uiAttach(mask);
     function close() { if (mask.parentNode) mask.parentNode.removeChild(mask); }
     bClose.addEventListener('click', close);
     mask.addEventListener('click', function (e) { if (e.target === mask) close(); });
@@ -600,6 +639,8 @@ var ZHR = (function () {
   /* ---------------- 存储（GM_* 跨子域共享） ---------------- */
 
   var K_INDEX = 'zhr.v1.index';
+  var K_UI_COURSE = 'zhr.v1.ui.course';
+  var K_UI_CHAPTER = 'zhr.v1.ui.chapter';
   /* GM 权限缺失时降级到同源 localStorage（面板/记录仍可用；跨子域共享退化为同源） */
   function sGet(k) {
     try { if (typeof GM_getValue === 'function') return GM_getValue(k, null); } catch (e) { /* ignore */ }
@@ -640,15 +681,46 @@ var ZHR = (function () {
 
   /* ---------------- 核心动作 ---------------- */
 
+  /* 面板状态记忆：课程名/章节名持久化，切换界面（页面重载）后自动恢复；
+     只有点「清空本课」才清除。 */
+  function statText() {
+    var c = loadCourse(currentCourseGuess());
+    if (!c || !c.questions.length) return '本课暂无记录（做完一章在解析页点「开始记录」）';
+    var chs = {};
+    c.questions.forEach(function (q) { chs[q.chapter || '未命名章节'] = 1; });
+    return '本课已记录 ' + c.questions.length + ' 题，覆盖 ' + Object.keys(chs).length + ' 个章节';
+  }
+  function refreshStatBar() {
+    var el = uiDoc().getElementById('zhr-stat');
+    if (el) el.textContent = statText();
+  }
+  function recordedText() {
+    var c = loadCourse(currentCourseGuess());
+    if (!c || !c.questions.length) return '（本课暂无记录）\n做完一章、进入「本次成绩/查看解析」页后点「▶ 开始记录」即可累积。';
+    var doc = coursesToDoc(c);
+    var out = [];
+    out.push('课程：' + (c.name || '未命名课程') + '　合计 ' + c.questions.length + ' 题');
+    doc.sections.forEach(function (sec) {
+      out.push('');
+      out.push('【' + sec.name + '】');
+      sec.questions.forEach(function (q, i) {
+        out.push((i + 1) + '. ' + q.stem);
+        if (q.options && q.options.length) out.push('   ' + optionsLine(q));
+        out.push('   答案：' + (q.answer || '未记录'));
+      });
+    });
+    return out.join('\n');
+  }
+
   function currentCourseGuess() {
-    var inp = document.getElementById('zhr-course-input');
+    var inp = uiDoc().getElementById('zhr-course-input');
     return normWs(inp ? inp.value : '') || guessCourseName();
   }
 
   function doRecord() {
     var containers = findQuestionContainers(document);
     var chapterGuess = guessChapterName();
-    var chapterInput = document.getElementById('zhr-chapter-input');
+    var chapterInput = uiDoc().getElementById('zhr-chapter-input');
     var courseName = currentCourseGuess();
     var chapterName = normWs(chapterInput ? chapterInput.value : '') || chapterGuess || '未命名章节';
 
@@ -677,18 +749,89 @@ var ZHR = (function () {
     var totalAll = course.questions.length;
 
     toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题；该课累计 ' + totalAll + ' 题');
+    refreshStatBar();
     return { ok: true, added: res.added.length, variants: res.variants.length, skipped: res.skipped, failed: failed, totalAll: totalAll };
+  }
+
+  /* ---------------- 页面结构侦察（合并自原侦察脚本） ---------------- */
+
+  var SCOUT_KW = /question|stem|topic|choice|option|answer|correct|right|wrong|result|parse|score|item|daan|chapter|section|unit|答题|题目|答案|解析|正确|错误|得分|测验|测试|判断|选择/i;
+
+  function oneLine(s, n) { return normWs(s).slice(0, n || 80); }
+
+  function scoutText() {
+    var out = [];
+    out.push('-- 页面结构侦察（candidates）--');
+    var SELECTOR = 'div,li,label,p,span,section,tr,td,h1,h2,h3,h4,h5,ul,ol,dl';
+    var nodes = document.querySelectorAll(SELECTOR);
+    var hits = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+      var id = el.id || '';
+      var cls = clsOf(el);
+      var txt = (el.innerText || '').trim();
+      if (!txt) continue;
+      if (SCOUT_KW.test(id) || SCOUT_KW.test(cls) || /^[（(]?[A-Ha-h][)）.、:]/.test(txt)) {
+        hits.push('<' + el.tagName.toLowerCase() + '> id="' + id + '" class="' + oneLine(cls, 60) + '" :: ' + oneLine(txt, 70));
+        if (hits.length >= 90) break;
+      }
+    }
+    out.push('candidateElements=' + hits.length);
+    for (var j = 0; j < hits.length; j++) out.push('  ' + hits[j]);
+
+    var ca = [];
+    var scanned = 0;
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    while (walker.nextNode() && scanned < 20000 && ca.length < 15) {
+      var e2 = walker.currentNode;
+      scanned++;
+      if (e2.closest && e2.closest('#zhr-root,#zhr-scout-root')) continue;
+      var c2 = '';
+      if (typeof e2.className === 'string') c2 = e2.className;
+      if (c2 && /\b(correct|right|answer|daan|true|green|wrong|red)\w*/i.test(c2)) {
+        ca.push(oneLine(c2, 60) + ' | ' + oneLine(e2.innerText || e2.textContent || '', 40));
+      }
+    }
+    if (ca.length) {
+      out.push('-- class 含 correct/right/answer/daan/true 等关键字的元素 --');
+      for (var k = 0; k < ca.length; k++) out.push('  ' + ca[k]);
+    }
+    return out.join('\n');
+  }
+
+  /* 页面正文文本（排除本脚本与 scout 的面板、以及 script/style 等），用于诊断预览 */
+  function pageTextOf() {
+    var parts = [];
+    var kids = (document.body && document.body.children) || [];
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (!k) continue;
+      var tag = k.tagName;
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEMPLATE' || tag === 'NOSCRIPT') continue;
+      if (k.id === 'zhr-root' || k.id === 'zhr-scout-root') continue;
+      var t = (typeof k.innerText === 'string' && k.innerText) || '';
+      if (t) parts.push(t);
+    }
+    return parts.join('\n');
   }
 
   function diagnosticText() {
     var out = [];
-    out.push('== v1 诊断快照 ==');
+    out.push('== 智慧树页面诊断快照 ==');
     out.push('version: ' + VERSION);
     out.push('url: ' + location.href);
     out.push('title: ' + normWs(document.title));
+    out.push('isTopFrame: ' + (window.top === window) + ' | readyState: ' + document.readyState);
     out.push('courseGuess: ' + guessCourseName());
     out.push('chapterGuess: ' + guessChapterName());
+    out.push('radioInputs=' + document.querySelectorAll('input[type=radio]').length +
+             ' checkboxInputs=' + document.querySelectorAll('input[type=checkbox]').length +
+             ' bodyTextLen=' + normWs(pageTextOf()).length);
+
+    /* 题库识别诊断 */
     var conts = findQuestionContainers(document);
+    out.push('-- 题库识别 --');
     out.push('containers=' + conts.length);
     for (var i = 0; i < conts.length && i < 30; i++) {
       var c = conts[i];
@@ -698,16 +841,20 @@ var ZHR = (function () {
       if (parsed.err) out.push('      parseErr: ' + parsed.err);
       else out.push('      stem=' + (parsed.stem || '').slice(0, 60) + ' | type=' + parsed.type + ' | opts=' + parsed.options.length + ' | ans=' + (parsed.answer || '').slice(0, 40));
     }
-    if (!conts.length) {
-      var txt = normWs(document.body.innerText);
-      out.push('-- body 文本预览（前 1200 字，用于人工定位）--');
-      out.push(txt.slice(0, 1200));
-      var tags = document.querySelectorAll('[class*="question" i],[class*="timu"],[class*="subject" i],[class*="item"],[id*="question" i],[id*="timu"]');
-      out.push('keywordElems=' + tags.length + '（下列为前 25 个的 class）');
-      for (var k = 0; k < tags.length && k < 25; k++) {
-        var el = tags[k];
-        out.push('  <' + el.tagName.toLowerCase() + '> class="' + clsOf(el).slice(0, 60) + '" text=' + normWs(el.innerText).slice(0, 30));
-      }
+
+    /* 页面结构侦察 */
+    out.push(scoutText());
+
+    /* 正文预览 */
+    out.push('-- body 文本预览（前 1500 字，已排除脚本面板）--');
+    out.push(normWs(pageTextOf()).slice(0, 1500));
+
+    /* 运行期错误 */
+    if (ERRORS.length) {
+      out.push('-- 运行期间捕获到的错误/警告（可能含页面自身脚本）--');
+      for (var m = 0; m < ERRORS.length && m < 12; m++) out.push('  ' + ERRORS[m]);
+    } else {
+      out.push('-- 运行期间未捕获到错误 --');
     }
     return out.join('\n');
   }
@@ -740,26 +887,39 @@ var ZHR = (function () {
     sSet(courseKeyFor(courseName), 'null');
     var list = loadCourseList().filter(function (c) { return c.name !== courseName; });
     sSet(K_INDEX, JSON.stringify(list));
+    /* 面板记忆也一并清除，回到空白状态 */
+    sSet(K_UI_COURSE, '');
+    sSet(K_UI_CHAPTER, '');
+    var ci = uiDoc().getElementById('zhr-course-input');
+    var hi = uiDoc().getElementById('zhr-chapter-input');
+    if (ci) ci.value = '';
+    if (hi) hi.value = '';
+    refreshStatBar();
     toast('已清空课程：' + courseName);
   }
 
-  function addStyle(css) {
-    try { if (typeof GM_addStyle === 'function') { GM_addStyle(css); return; } } catch (e) { /* fallback below */ }
-    var st = document.createElement('style');
-    st.textContent = css;
-    (document.head || document.documentElement).appendChild(st);
+  function addStyleTo(doc, css) {
+    try {
+      var st = doc.createElement('style');
+      st.textContent = css;
+      (doc.head || doc.documentElement).appendChild(st);
+      return;
+    } catch (e) { /* fall through */ }
+    try { if (typeof GM_addStyle === 'function') GM_addStyle(css); } catch (e2) { /* ignore */ }
   }
 
   function initUI() {
     if (window.__zhrV1UI) return;
     if (!document.body) return;
-    var bodyLen = (document.body.innerText || '').length;
-    var showHere = (window.top === window) || bodyLen >= 1200;
-    if (!showHere) return;
+    var udoc = uiDoc();
+    var uwin = udoc.defaultView || window;
+    /* 顶层去重：多个 frame 都注入时，只在最顶层可达文档里放一份面板 */
+    if (uwin.__zhrV1UI) return;
+    uwin.__zhrV1UI = true;
     window.__zhrV1UI = true;
     try { if (window.console && console.log) console.log('[ZHR v' + VERSION + '] init on ' + location.href + ' | top=' + (window.top === window)); } catch (e2) { /* ignore */ }
 
-    addStyle(
+    addStyleTo(udoc,
       '#zhr-root{position:fixed;right:16px;bottom:16px;z-index:2147483646;font:12px/1.5 "Microsoft YaHei",sans-serif;color:#222;width:330px;border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.25);background:#fff;overflow:hidden}' +
       '#zhr-head{background:#2f6fed;color:#fff;padding:8px 12px;cursor:move;font-weight:700;display:flex;align-items:center;user-select:none}' +
       '#zhr-head .t{flex:1}' +
@@ -773,7 +933,9 @@ var ZHR = (function () {
       '#zhr-b2{background:#27ae60;color:#fff}' +
       '#zhr-b3{background:#eef1f6;color:#333}' +
       '#zhr-b4{background:#fdecea;color:#c0392b}' +
-      '#zhr-tip{margin-top:8px;color:#999;font-size:11px}'
+      '#zhr-b5{background:#6c5ce7;color:#fff}' +
+      '#zhr-stat{margin-top:8px;color:#2f6fed;font-size:11px}' +
+      '#zhr-tip{margin-top:6px;color:#999;font-size:11px}'
     );
 
     var root = document.createElement('div');
@@ -814,20 +976,33 @@ var ZHR = (function () {
     bDiag.id = 'zhr-b3'; bDiag.textContent = '🔍 诊断';
     var bClear = document.createElement('button');
     bClear.id = 'zhr-b4'; bClear.textContent = '清空本课';
-    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bClear);
+    var bList = document.createElement('button');
+    bList.id = 'zhr-b5'; bList.textContent = '📚 已记录';
+    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bClear);
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
     tip.textContent = '用法：做完一章→在“成绩/查看解析”页点「开始记录」；每章点一次，自动累计。快捷键 Ctrl+Shift+X 也可记录。';
 
+    var stat = document.createElement('div');
+    stat.id = 'zhr-stat';
+
     body.appendChild(lb1); body.appendChild(courseInput);
     body.appendChild(lb2); body.appendChild(chapterInput);
-    body.appendChild(btns); body.appendChild(tip);
+    body.appendChild(btns); body.appendChild(stat); body.appendChild(tip);
     root.appendChild(head); root.appendChild(body);
-    document.documentElement.appendChild(root);
+    (udoc.body || udoc.documentElement).appendChild(root);
 
-    courseInput.value = guessCourseName();
-    chapterInput.value = guessChapterName();
+    /* 记忆优先：有保存过就用保存值，否则用自动识别；用户改动即时保存 */
+    var savedCourse = sGet(K_UI_COURSE) || '';
+    var savedChapter = sGet(K_UI_CHAPTER) || '';
+    courseInput.value = savedCourse || guessCourseName();
+    chapterInput.value = savedChapter || guessChapterName();
+    if (!savedCourse && courseInput.value) sSet(K_UI_COURSE, courseInput.value);
+    if (!savedChapter && chapterInput.value) sSet(K_UI_CHAPTER, chapterInput.value);
+    courseInput.addEventListener('input', function () { sSet(K_UI_COURSE, normWs(courseInput.value)); refreshStatBar(); });
+    chapterInput.addEventListener('input', function () { sSet(K_UI_CHAPTER, normWs(chapterInput.value)); });
+    refreshStatBar();
 
     /* 拖动 */
     var dragging = false, dx = 0, dy = 0;
@@ -837,12 +1012,12 @@ var ZHR = (function () {
       dy = e.clientY - root.getBoundingClientRect().top;
       e.preventDefault();
     });
-    document.addEventListener('mousemove', function (e) {
+    udoc.addEventListener('mousemove', function (e) {
       if (!dragging) return;
       root.style.left = Math.max(0, Math.min(window.innerWidth - root.offsetWidth, e.clientX - dx)) + 'px';
       root.style.top = Math.max(0, Math.min(window.innerHeight - root.offsetHeight, e.clientY - dy)) + 'px';
     });
-    document.addEventListener('mouseup', function () { dragging = false; });
+    udoc.addEventListener('mouseup', function () { dragging = false; });
 
     var minimized = false;
     bMin.addEventListener('click', function () {
@@ -856,15 +1031,20 @@ var ZHR = (function () {
     bDiag.addEventListener('click', function () {
       showModal('v1 诊断快照（复制后发给开发者）', '', diagnosticText());
     });
+    bList.addEventListener('click', function () {
+      showModal('本课已记录题目（可复制保存）', '', recordedText());
+    });
     bClear.addEventListener('click', doClearCourse);
 
-    document.addEventListener('keydown', function (e) {
+    udoc.addEventListener('keydown', function (e) {
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyX') { e.preventDefault(); doRecord(); }
     });
 
     setTimeout(function () {
-      if (!courseInput.value) courseInput.value = guessCourseName();
-      if (!chapterInput.value) chapterInput.value = guessChapterName();
+      /* 页面晚渲染时补一次识别：仅在为空时填入并记下，不覆盖用户已有内容 */
+      if (!courseInput.value) { courseInput.value = guessCourseName(); if (courseInput.value) sSet(K_UI_COURSE, courseInput.value); }
+      if (!chapterInput.value) { chapterInput.value = guessChapterName(); if (chapterInput.value) sSet(K_UI_CHAPTER, chapterInput.value); }
+      refreshStatBar();
     }, 1500);
   }
 
@@ -883,9 +1063,16 @@ var ZHR = (function () {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = ZHR;
 } else {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { ZHR.init(); });
-  } else {
-    ZHR.init();
-  }
+  /* 学习/考试页常是异步渲染的多层 iframe：轮询等 body 出现再注入，别错过时机 */
+  (function boot() {
+    if (!document.body) {
+      if ((boot.tries = (boot.tries || 0) + 1) < 60) setTimeout(boot, 250);
+      return;
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function () { ZHR.init(); });
+    } else {
+      ZHR.init();
+    }
+  })();
 }
