@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.5.0
+// @version      1.5.2
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.5.0';
+  var VERSION = '1.5.2';
 
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
@@ -351,11 +351,13 @@ var ZHR = (function () {
     if (code >= 0xFF41 && code <= 0xFF5A) return String.fromCharCode(code - 0xFEE0);
     return ch;
   }
-  var ANSWER_LINE_RE = /(正确答案|参考答案|标准答案|正确答案是)/;
+  var ANSWER_LINE_RE = /(正确答案|参考答案|标准答案|答案[:：])/;
   var ANSWER_LINE_ANY_RE = /答案[:：]?\s*([^\n]{0,60})/;
   var CORRECT_CLS_RE = /\b(correct|right|answer|daan|green|succ|pass|true)\w*/i;
   var MARKED_WRONG_RE = /\b(wrong|incorrect|false|error)\w*/i;
   var CONTAINER_CLS_RE = /(question|timu|topic|subject|exam|test|answer|result|choice|item)/i;
+  /* 答题卡/答案汇总区：不能被当成题目记录 */
+  var CARD_RE = /(答题卡|答案卡|答题情况|答案汇总|全部答案|答案速览|答题记录|答案列表|答案一览)/;
 
   function splitLines(t) {
     return String(t || '').split(/\r?\n/).map(function (s) { return normWs(s); }).filter(Boolean);
@@ -392,6 +394,7 @@ var ZHR = (function () {
       if (!(CONTAINER_CLS_RE.test(idc) || CONTAINER_CLS_RE.test(clsc))) continue;
       var txt = innerTextOf(el);
       if (txt.length < 8 || txt.length > 20000) continue;
+      if (CARD_RE.test(normWs(txt).slice(0, 80))) continue;   /* 答题卡/答案汇总 */
       if (!hasAnswerMarker(el)) continue;
       cands.push(el);
     }
@@ -406,10 +409,51 @@ var ZHR = (function () {
     return usable;
   }
 
+  /* 内容特征判定：答题卡/答案汇总块（题号紧跟答案字母的行占多数；或题干里混入多个题号） */
+  function looksLikeAnswerCard(container, parsed) {
+    var raw = innerTextOf(container);
+    if (CARD_RE.test(normWs(raw).slice(0, 80))) return true;
+    var lines = splitLines(raw);
+    if (lines.length >= 4) {
+      var n = 0;
+      for (var i = 0; i < lines.length; i++) {
+        if (/^\d{1,3}\s*[.、．)）:：]?\s*[A-Ha-h√×对错]/.test(lines[i])) n++;
+      }
+      if (n >= 4 && n / lines.length >= 0.5) return true;
+    }
+    var stem = (parsed && parsed.stem) || '';
+    if (/^(答题卡|答案卡|答案汇总|全部答案|答题情况)/.test(stem)) return true;
+    if ((stem.match(/\d{1,3}\s*[.、．]/g) || []).length >= 3) return true;
+    return false;
+  }
+
+  /* 文本净化：去掉界面文案、表情、零宽字符（题目题干/选项里不该有的杂质） */
+  function cleanText(s) {
+    var t = String(s || '');
+    t = t.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ' ');                       /* emoji（代理对） */
+    t = t.replace(/[\u2190-\u21FF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u25A0-\u25FF]/g, ' ');
+    t = t.replace(/(AI答题辅导|AI解析|AI智能解析|收藏为薄弱题|加入薄弱题|加入错题|薄弱题|收藏|纠错|报错|举报|分享|添加笔记|记笔记|笔记|点赞)/g, ' ');
+    return t.replace(/\s+/g, ' ').trim();
+  }
+
+  /* 是否是“无字母的选项文字行”（多个短词，无括号/句末标点），是则返回词列表 */
+  function bareOptionWords(line) {
+    var t = cleanText(line);
+    if (!t || t.length > 200) return null;
+    if (/[。.；;：:!?？]$/.test(t)) return null;
+    if (/[（()）]/.test(t)) return null;
+    var parts = t.split(/\s+/);
+    if (parts.length < 2 || parts.length > 8) return null;
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].length > 24) return null;
+    }
+    return parts;
+  }
+
   /* 从一个题目容器的行文本里解析题干/选项/答案（行文本模型，兼容多数布局） */
   function parseLines(containerText) {
     var lines = splitLines(containerText);
-    var stemLines = [], options = [], bareOpts = [], ansText = '', ansLineIdx = -1;
+    var stemLines = [], options = [], bareOpts = [], ansText = '', ansLineIdx = -1, pendingOpts = null;
     for (var i = 0; i < lines.length; i++) {
       var L = lines[i];
       if (ANSWER_LINE_RE.test(L)) {
@@ -422,14 +466,22 @@ var ZHR = (function () {
       if (/^(我的答案|您的答案|回答正确|回答错误|答对|答错|已作答|未作答|答案解析|解析|考查知识点|知识点)/.test(L)) continue;
       var m = L.match(OPT_RE);
       if (m) {
-        options.push({ letter: normLetter(m[1]).toUpperCase(), text: L.replace(OPT_RE, '').trim() });
+        var letter = normLetter(m[1]).toUpperCase();
+        var otext = cleanText(L.replace(OPT_RE, ''));
+        /* 选项字母与文字分离的布局：字母行没文字时，把上一行的“裸词列表”拿来做选项文字 */
+        if (!options.length && !otext && stemLines.length) {
+          var words = bareOptionWords(stemLines[stemLines.length - 1]);
+          if (words && words.length >= 2) { stemLines.pop(); pendingOpts = words; }
+        }
+        if (!otext && pendingOpts && options.length < pendingOpts.length) otext = pendingOpts[options.length];
+        options.push({ letter: letter, text: otext });
         continue;
       }
       /* 无字母前缀的判断题短选项（对/错/正确/错误/是/否/√/×） */
       if (/^(对|错|正确|错误|是|否|√|×)$/.test(L)) { bareOpts.push(L); continue; }
       if (ansLineIdx === -1) stemLines.push(L);
     }
-    var stem = normWs(stemLines.join(' '));
+    var stem = cleanText(stemLines.join(' '));
     /* 去掉开头的题型标签（单选 题 / 判断 题 ...），其后的题号由 normalizeStem 剥离 */
     stem = stem.replace(/^(单选|多选|判断|填空|简答|不定项|单项选择|多项选择)\s*题?\s*(?=\d)/, '');
     stem = normalizeStem(stem);
@@ -730,11 +782,13 @@ var ZHR = (function () {
     }
 
     var incoming = [];
-    var failed = 0;
+    var failed = 0, cardSkipped = 0;
     for (var i = 0; i < containers.length; i++) {
       try {
         var q = parseQuestion(containers[i], chapterName);
-        if (q.stem) incoming.push(q); else failed++;
+        if (!q.stem) { failed++; continue; }
+        if (looksLikeAnswerCard(containers[i], q)) { cardSkipped++; continue; }
+        incoming.push(q);
       } catch (err) { failed++; }
     }
     if (!incoming.length) {
@@ -748,7 +802,7 @@ var ZHR = (function () {
     saveCourse(courseName, course);
     var totalAll = course.questions.length;
 
-    if (!silent) toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题；该课累计 ' + totalAll + ' 题');
+    if (!silent) toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题' + (cardSkipped ? '，跳过答题卡 ' + cardSkipped + ' 块' : '') + '；该课累计 ' + totalAll + ' 题');
     refreshStatBar();
     return { ok: true, added: res.added.length, variants: res.variants.length, skipped: res.skipped, failed: failed, totalAll: totalAll };
   }
@@ -964,6 +1018,7 @@ var ZHR = (function () {
       var parsed = { err: '' };
       try { parsed = parseQuestion(c, ''); } catch (e) { parsed = { err: e.message }; }
       if (parsed.err) out.push('      parseErr: ' + parsed.err);
+      else if (looksLikeAnswerCard(c, parsed)) out.push('      → 判定为答题卡/无效块（将被跳过）');
       else out.push('      stem=' + (parsed.stem || '').slice(0, 60) + ' | type=' + parsed.type + ' | opts=' + parsed.options.length + ' | ans=' + (parsed.answer || '').slice(0, 40));
     }
 
