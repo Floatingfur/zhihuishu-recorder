@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.7.3
+// @version      1.7.4
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,8 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.7.3';
-
+  var VERSION = '1.7.4';
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
   function collectErr(ev) {
@@ -629,24 +628,29 @@ var ZHR = (function () {
     var sel = '[class*="catalog" i],[class*="catalogue" i],[class*="chapter" i],[class*="tree" i],' +
               '[class*="directory" i],[class*="menu" i],[class*="nav" i],[class*="sider" i],' +
               '[class*="aside" i],[class*="knowledge" i],[class*="outline" i],[class*="catalogItem" i]';
-    var scopes = document.querySelectorAll(sel);
+    var docs = pilotDocs();
     var best = null;
-    for (var i = 0; i < scopes.length; i++) {
-      var sc = scopes[i];
-      if (sc.closest && sc.closest('#zhr-root,#zhr-scout-root')) continue;
-      if (/\b(question|timu|exam|test|answer|result|choice)\b/i.test(clsOf(sc))) continue;  /* 别把题目区当目录 */
-      if (!visOk(sc)) continue;
-      var els = sc.querySelectorAll('a,li');
-      var items = [];
-      for (var j = 0; j < els.length && items.length < 200; j++) {
-        var el = els[j];
-        if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
-        if (!visOk(el)) continue;
-        var t = cleanText(el.innerText || '');
-        if (!t || t.length > 40) continue;
-        items.push({ el: el, t: t });
+    for (var d0 = 0; d0 < docs.length; d0++) {
+      var scopes;
+      try { scopes = docs[d0].querySelectorAll(sel); } catch (e0) { continue; }
+      for (var i = 0; i < scopes.length; i++) {
+        var sc = scopes[i];
+        if (sc.closest && sc.closest('#zhr-root,#zhr-scout-root')) continue;
+        if (/\b(question|timu|exam|test|answer|result|choice)\b/i.test(clsOf(sc))) continue;  /* 别把题目区当目录 */
+        if (!visOk(sc)) continue;
+        var els;
+        try { els = sc.querySelectorAll('a,li'); } catch (e1) { continue; }
+        var items = [];
+        for (var j = 0; j < els.length && items.length < 200; j++) {
+          var el = els[j];
+          if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+          if (!visOk(el)) continue;
+          var t = cleanText(el.innerText || '');
+          if (!t || t.length > 60) continue;
+          items.push({ el: el, t: t });
+        }
+        if (items.length >= 3 && (!best || items.length > best.length)) best = items;
       }
-      if (items.length >= 3 && (!best || items.length > best.length)) best = items;
     }
     return best;
   }
@@ -673,27 +677,37 @@ var ZHR = (function () {
   }
 
   function guessCourseName() {
-    /* 1) 优先取“页面左上角”那块（课程名通常就在左上角） */
-    var vw = window.innerWidth || 1200, vh = window.innerHeight || 800;
-    var els = document.querySelectorAll('h1,h2,h3,h4,h5,div,span,a,p,strong,b');
+    /* 1) 优先取“页面左上角”那块（课程名通常就在左上角）
+       内容常在子 iframe 里，而面板挂在顶层文档，所以必须跨同源 frame 一起扫 */
+    var docs = pilotDocs();
     var cand = [];
-    for (var i = 0; i < els.length && i < 4000; i++) {
-      var el = els[i];
-      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
-      var t = cleanText(el.innerText || '');
-      if (!t || t.length < 2 || t.length > 40) continue;
-      if (/^(首页|主页|登录|智慧树|知到|我的|课程中心|学习中心|个人中心)$/.test(t)) continue;
-      if (CHAP_RE.test(t)) continue;                       /* 章节标题不当课程名 */
-      var r = el.getBoundingClientRect();
-      if (r.width < 8 || r.height < 8) continue;
-      if (r.left > vw * 0.35 || r.top > vh * 0.30) continue;  /* 只看左上角区域 */
-      if (r.width > vw * 0.6) continue;
-      var score = r.left * 2 + r.top;
-      if (/(学年|学期|课程|大学|学院)/.test(t)) score -= 600;   /* 含学年/学期优先 */
-      cand.push({ t: t, score: score });
+    for (var d0 = 0; d0 < docs.length; d0++) {
+      var doc = docs[d0];
+      var vw = 1200, vh = 800;
+      try {
+        var w0 = doc.defaultView;
+        if (w0) { vw = w0.innerWidth || vw; vh = w0.innerHeight || vh; }
+      } catch (e0) { /* ignore */ }
+      var els;
+      try { els = doc.querySelectorAll('h1,h2,h3,h4,h5,div,span,a,p,strong,b'); } catch (e1) { continue; }
+      for (var i = 0; i < els.length && i < 4000; i++) {
+        var el = els[i];
+        if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+        var t = cleanText(el.innerText || '');
+        if (!t || t.length < 2 || t.length > 40) continue;
+        if (/^(首页|主页|登录|智慧树|知到|我的|课程中心|学习中心|个人中心)$/.test(t)) continue;
+        if (CHAP_RE.test(t)) continue;                       /* 章节标题不当课程名 */
+        var r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) continue;
+        if (r.left > vw * 0.35 || r.top > vh * 0.30) continue;  /* 只看左上角区域 */
+        if (r.width > vw * 0.6) continue;
+        /* 档次：含“学年/学期”的最像课程名，其次“课程/大学/学院”，最后其它 */
+        var tier = /(学年|学期)/.test(t) ? 0 : (/(课程|大学|学院)/.test(t) ? 1 : 2);
+        cand.push({ t: t, tier: tier, score: r.left * 2 + r.top });
+      }
     }
     if (cand.length) {
-      cand.sort(function (a, b) { return a.score - b.score; });
+      cand.sort(function (a, b) { return (a.tier - b.tier) || (a.score - b.score); });
       return cand[0].t;
     }
     var title = normWs(document.title || '');
@@ -765,15 +779,19 @@ var ZHR = (function () {
     }
     /* 回退：正文里找“第X章”，再找同容器里第一个单元行 */
     var re = /第\s*[0-9一二三四五六七八九十百零]+\s*[章节讲单元课]\s*[^\s]{0,20}/;
-    var els = document.querySelectorAll('h1,h2,h3,h4,.chapter,.section,.unit,li,span,div,b,strong,p');
     var best = '', bestEl = null;
-    for (var n = 0; n < els.length && n < 300; n++) {
-      var el = els[n];
-      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
-      var t = cleanText(el.innerText || '');
-      if (!t || t.length > 40) continue;
-      if (re.test(t)) {
-        if (!best || t.length < best.length) { best = t; bestEl = el; }
+    var docs2 = pilotDocs();
+    for (var d3 = 0; d3 < docs2.length; d3++) {
+      var els;
+      try { els = docs2[d3].querySelectorAll('h1,h2,h3,h4,.chapter,.section,.unit,li,span,div,b,strong,p'); } catch (e3) { continue; }
+      for (var n = 0; n < els.length && n < 300; n++) {
+        var el = els[n];
+        if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+        var t = cleanText(el.innerText || '');
+        if (!t || t.length > 40) continue;
+        if (re.test(t)) {
+          if (!best || t.length < best.length) { best = t; bestEl = el; }
+        }
       }
     }
     if (best) {
@@ -1003,7 +1021,7 @@ var ZHR = (function () {
   var BTN_SECTION_RE = /(下一节|下一个|下一章|下一课|下一讲|下一个视频|继续学习)/;
   var CLOSE_SIG_RE = /(close|exit|back|关闭|退出|返回)/i;
 
-  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, videoDone: false, catalogExhausted: false, lastAction: '', sameAction: 0 };
+  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, catalogCache: null, videoDone: false, catalogExhausted: false, switchFails: 0, lastAction: '', sameAction: 0 };
 
   function pilotLog(msg) {
     PILOT.logs.push(new Date().toLocaleTimeString('zh-CN') + ' ' + msg);
@@ -1133,42 +1151,126 @@ var ZHR = (function () {
     return out;
   }
 
-  /* 目录条目：先走 class 关键词快路径，再走“通用列表”识别（不依赖 class 名） */
+  /* 目录条目：跨同源 iframe 扫描；先走 class 关键词快路径，再走“通用列表”识别（不依赖 class 名、允许折叠项） */
   function pilotCatalogItems() {
-    var fastSel = '[class*="catalog" i] li,[class*="chapter" i] li,[class*="menu" i] li,' +
-                  '[class*="nav" i] li,[class*="list" i] li,[class*="tree" i] li,' +
-                  '[class*="catalog" i] a,[class*="chapter" i] a,[class*="menu" i] a,[class*="nav" i] a';
-    var fast = document.querySelectorAll(fastSel);
-    var list = [];
-    for (var i = 0; i < fast.length; i++) if (pilotVisible(fast[i])) list.push(fast[i]);
-    if (list.length >= 2) return list;
-
-    /* 通用路径：找“左侧、条目多、每条文本都短”的容器当目录 */
-    var vw = window.innerWidth || 1200;
-    var boxes = document.querySelectorAll('ul,ol,div,section,nav,aside');
-    var best = null, bestScore = null;
-    for (var d = 0; d < boxes.length && d < 5000; d++) {
-      var box = boxes[d];
-      if (box.closest && box.closest('#zhr-root,#zhr-scout-root')) continue;
-      var kids = box.children;
-      if (!kids || kids.length < 3 || kids.length > 150) continue;
-      var rb = box.getBoundingClientRect();
-      if (rb.width < 40 || rb.height < 30) continue;
-      if (rb.left > vw * 0.45) continue;                    /* 目录一般在左侧 */
-      var items = [], ok = true, hint = 0;
-      for (var k = 0; k < kids.length; k++) {
-        var kid = kids[k];
-        if (!pilotVisible(kid)) { ok = false; break; }
-        var t = cleanText(kid.innerText || '');
-        if (!t || t.length > 60) { ok = false; break; }
-        if (CHAP_RE.test(t) || UNIT_RE.test(t) || /必学|知识点|单元|模块|课|节/.test(t)) hint++;
-        items.push(kid);
-      }
-      if (!ok || items.length < 3 || hint < 1) continue;
-      var score = items.length * 10 - rb.left - rb.top / 10;
-      if (bestScore === null || score > bestScore) { bestScore = score; best = items; }
+    if (PILOT.catalogCache && PILOT.catalogCache.length) {
+      var c0 = PILOT.catalogCache[0];
+      if (c0 && c0.isConnected !== false) return PILOT.catalogCache;   /* 缓存仍有效 */
     }
-    return best || [];
+    var fastSel = '[class*="catalog" i] li,[class*="catalog" i] a,[class*="chapter" i] li,' +
+                  '[class*="menu" i] li,[class*="nav" i] li,[class*="tree" i] li,[class*="tree" i] a,' +
+                  '[class*="sidebar" i] li,[class*="sider" i] li,[class*="list" i] li,[class*="list" i] a';
+    var docs = pilotDocs();
+    var fast = [];
+    for (var d0 = 0; d0 < docs.length; d0++) {
+      var qs;
+      try { qs = docs[d0].querySelectorAll(fastSel); } catch (e0) { continue; }
+      var n0 = Math.min(qs.length, 600);
+      for (var i = 0; i < n0; i++) {
+        var el0 = qs[i];
+        if (el0.closest && el0.closest('#zhr-root,#zhr-scout-root')) continue;
+        if (!pilotVisible(el0)) continue;
+        var t0 = cleanText(el0.innerText || '');
+        if (!t0 || t0.length > 60) continue;
+        fast.push(el0);
+      }
+    }
+    if (fast.length >= 2) { PILOT.catalogCache = fast; return fast; }
+
+    /* 通用路径：找“在左边、条目多、每条都是短文本”的容器当目录 */
+    var best = null, bestScore = null;
+    for (var d = 0; d < docs.length; d++) {
+      var doc = docs[d];
+      var vw = 1200;
+      try { if (doc.defaultView) vw = doc.defaultView.innerWidth || vw; } catch (e1) { /* ignore */ }
+      var boxes;
+      try { boxes = doc.querySelectorAll('ul,ol,div,section,nav,aside'); } catch (e2) { continue; }
+      var nb = Math.min(boxes.length, 6000);
+      for (var b = 0; b < nb; b++) {
+        var box = boxes[b];
+        if (box.closest && box.closest('#zhr-root,#zhr-scout-root')) continue;
+        var kids = box.children;
+        if (!kids || kids.length < 3 || kids.length > 400) continue;
+        var rb = box.getBoundingClientRect();
+        if (rb.width < 40 || rb.height < 24) continue;
+        if (rb.left > vw * 0.5) continue;                    /* 目录一般在左侧 */
+        var items = [], hint = 0, visCount = 0;
+        for (var k = 0; k < kids.length; k++) {
+          var kid = kids[k];
+          if (!pilotVisible(kid)) continue;                  /* 折叠隐藏的子项不算失败 */
+          var t = cleanText(kid.innerText || '');
+          if (!t || t.length > 60) continue;
+          visCount++;
+          if (CHAP_RE.test(t) || UNIT_RE.test(t) || /必学|知识点|单元|模块|课|节|测验|视频/.test(t)) hint++;
+          items.push(kid);
+        }
+        if (items.length < 3) continue;
+        if (visCount < kids.length * 0.5 && hint < 3) continue;   /* 大多是隐藏项且无章节特征 */
+        if (hint < 1) continue;
+        var score = items.length * 10 + visCount * 5 - rb.left - rb.top / 10;
+        if (bestScore === null || score > bestScore) { bestScore = score; best = items; }
+      }
+    }
+    if (best) { PILOT.catalogCache = best; return best; }
+    PILOT.catalogCache = null;
+    return [];
+  }
+
+  /* 找不到目录时的现场诊断信息（写到日志里，便于不改代码定位） */
+  function pilotCatalogStats() {
+    var docs = [];
+    try { docs = pilotDocs(); } catch (e) { docs = []; }
+    var boxes = 0, maxKid = 0, maxVis = 0;
+    for (var d = 0; d < docs.length; d++) {
+      var doc = docs[d];
+      var vw = 1200;
+      try { if (doc.defaultView) vw = doc.defaultView.innerWidth || vw; } catch (e1) { /* ignore */ }
+      var all;
+      try { all = doc.querySelectorAll('ul,ol,div,section,nav,aside'); } catch (e2) { continue; }
+      var n = Math.min(all.length, 6000);
+      for (var i = 0; i < n; i++) {
+        var box = all[i];
+        if (box.closest && box.closest('#zhr-root,#zhr-scout-root')) continue;
+        var kids = box.children;
+        if (!kids || kids.length < 3) continue;
+        var rb = box.getBoundingClientRect();
+        if (rb.width < 40 || rb.height < 24 || rb.left > vw * 0.5) continue;
+        var vis = 0;
+        for (var k = 0; k < kids.length; k++) {
+          if (!pilotVisible(kids[k])) continue;
+          var t = cleanText(kids[k].innerText || '');
+          if (t && t.length <= 60) vis++;
+        }
+        if (vis < 3) continue;
+        boxes++;
+        if (kids.length > maxKid) maxKid = kids.length;
+        if (vis > maxVis) maxVis = vis;
+      }
+    }
+    return '左栏候选容器 ' + boxes + '（最多子项 ' + maxKid + '、可见短文本子项 ' + maxVis + '）';
+  }
+
+  /* 点目录条目：优先点最里层的可点元素，并补上原生 click / 回车（不同树控件响应方式不一样） */
+  function pilotClickItem(el) {
+    var target = el, deep = null;
+    try { deep = el.querySelector('a[href],button,[role="button"]'); } catch (e) { deep = null; }
+    if (deep && pilotVisible(deep) && normWs(deep.innerText || '').length <= 60) target = deep;
+    pilotFireClick(target);
+    var isBlank = false;
+    try { isBlank = /(^|,)\s*_blank/.test(target.getAttribute('target') || ''); } catch (e2) { /* ignore */ }
+    if (!isBlank && (target.tagName === 'A' || target.tagName === 'BUTTON')) {
+      try { target.click(); } catch (e3) { /* ignore */ }
+    } else {
+      /* 非链接/按钮：聚焦后补一个回车（部分树控件只认键盘） */
+      try {
+        if (target.focus) target.focus();
+        var w = (target.ownerDocument && target.ownerDocument.defaultView) || window;
+        var ev = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+        target.dispatchEvent(new w.KeyboardEvent('keydown', ev));
+        target.dispatchEvent(new w.KeyboardEvent('keyup', ev));
+      } catch (e4) { /* ignore */ }
+    }
+    return target;
   }
 
   /* 顺序切到下一个视频/节点（首次从当前高亮项往下走，之后递增，不重复点同一项） */
@@ -1181,13 +1283,13 @@ var ZHR = (function () {
       for (var i = 0; i < list.length; i++) { if (isActiveItem(list[i])) { idx = i; break; } }
     }
     var next = idx + 1;
-    if (next >= list.length) { PILOT.catalogExhausted = true; pilotLog('目录已到最后一节'); return null; }
+    while (next < list.length && DANGER_RE.test(normWs(list[next].innerText || ''))) next++;
+    if (next >= list.length) { PILOT.catalogExhausted = true; pilotLog('目录已到最后一节（共 ' + list.length + ' 项）'); return null; }
     var el = list[next];
     var t = normWs(el.innerText || '');
-    if (DANGER_RE.test(t)) { PILOT.catalogIdx = next; return null; }
     PILOT.catalogIdx = next;
     PILOT.catalogExhausted = false;
-    pilotFireClick(el);
+    pilotClickItem(el);
     return t.slice(0, 24);
   }
 
@@ -1225,11 +1327,13 @@ var ZHR = (function () {
     if (PILOT.videoDone) {
       PILOT.videoDone = false;
       var n0 = pilotNextCatalog();
-      if (n0) { PILOT.idle = 0; pilotLog('→ 下一个视频/节点（' + n0 + '）'); return; }
+      if (n0) { PILOT.idle = 0; PILOT.switchFails = 0; pilotLog('→ 下一个视频/节点（' + n0 + '）'); return; }
       var ns = pilotClick(BTN_SECTION_RE, 20);          /* 兔底：页面上的“下一节/下一个”按钮 */
-      if (ns) { PILOT.idle = 0; pilotLog('→ 下一节（' + ns + '）'); return; }
+      if (ns) { PILOT.idle = 0; PILOT.switchFails = 0; pilotLog('→ 下一节（' + ns + '）'); return; }
       if (PILOT.catalogExhausted) { pilotStop('已遍历完课程（最后一个视频已完成）'); return; }
-      pilotLog('未识别到目录/下一节按钮，无法自动切下一个（请把「诊断」快照发给开发者）');
+      PILOT.switchFails = (PILOT.switchFails || 0) + 1;
+      pilotLog('未识别到目录/下一节按钮，无法自动切下一个（' + pilotCatalogStats() + '）');
+      if (PILOT.switchFails >= 2) { pilotStop('连续两次无法切到下一个视频，已停止以免重复进入同一视频'); return; }
     }
 
     /* 3) 打开解析 */
@@ -1256,8 +1360,10 @@ var ZHR = (function () {
     PILOT.logs = [];
     PILOT.idle = 0;
     PILOT.catalogIdx = null;
+    PILOT.catalogCache = null;
     PILOT.videoDone = false;
     PILOT.catalogExhausted = false;
+    PILOT.switchFails = 0;
     PILOT.lastAction = '';
     PILOT.sameAction = 0;
     pilotLog('开始自动遍历（不答题、不提交）');
@@ -1461,6 +1567,7 @@ var ZHR = (function () {
       '#zhr-b4{background:#fdecea;color:#c0392b}' +
       '#zhr-b5{background:#6c5ce7;color:#fff}' +
       '#zhr-b6{background:#e67e22;color:#fff}' +
+      '#zhr-b7{background:#0f9d8f;color:#fff}' +
       '#zhr-stat{margin-top:8px;color:#2f6fed;font-size:11px}' +
       '#zhr-pilotlog{margin-top:6px;color:#666;font-size:10px;line-height:1.4;white-space:pre-wrap;max-height:54px;overflow:auto}' +
       '#zhr-tip{margin-top:6px;color:#999;font-size:11px}'
@@ -1508,11 +1615,13 @@ var ZHR = (function () {
     bList.id = 'zhr-b5'; bList.textContent = '📚 已记录';
     var bAuto = document.createElement('button');
     bAuto.id = 'zhr-b6'; bAuto.textContent = '🤖 自动遍历';
-    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bAuto); btns.appendChild(bClear);
+    var bNext = document.createElement('button');
+    bNext.id = 'zhr-b7'; bNext.textContent = '⏭ 下一个（测试）';
+    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bAuto); btns.appendChild(bNext); btns.appendChild(bClear);
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
-    tip.textContent = '课程名/章节名自动识别（点进章节会更新为该章+第一个单元名），手改后以你改的为准；「清空本课」恢复自动。用法：把解析页点「开始记录」，快捷键 Ctrl+Shift+X。';
+    tip.textContent = '课程名/章节名自动识别（点进章节会更新为该章+第一个单元名），手改后以你改的为准；「清空本课」恢复自动。用法：把解析页点「开始记录」，快捷键 Ctrl+Shift+X。「⏭ 下一个（测试）」可手动切下一个视频。';
 
     var stat = document.createElement('div');
     stat.id = 'zhr-stat';
@@ -1593,6 +1702,13 @@ var ZHR = (function () {
       showModal('本课已记录题目（可复制保存）', '', recordedText());
     });
     bAuto.addEventListener('click', pilotToggle);
+    bNext.addEventListener('click', function () {
+      /* 手动切下一个：当场验证目录识别，日志会写出找到多少目录项 */
+      if (!PILOT.running) { PILOT.catalogIdx = null; PILOT.catalogCache = null; }
+      var t = pilotNextCatalog();
+      if (t) pilotLog('（手动）→ 下个视频/节点（' + t + '）');
+      else pilotLog('（手动）没找到可切的目录项 → ' + pilotCatalogStats());
+    });
     bClear.addEventListener('click', doClearCourse);
 
     udoc.addEventListener('keydown', function (e) {
