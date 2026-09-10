@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.4.0
-// @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察与运行错误收集，点「诊断」一键出报告。纯本地运行，不联网、不自动答题。
+// @version      1.5.0
+// @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
 // @match        http://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.4.0';
+  var VERSION = '1.5.0';
 
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
@@ -717,15 +717,15 @@ var ZHR = (function () {
     return normWs(inp ? inp.value : '') || guessCourseName();
   }
 
-  function doRecord() {
-    var containers = findQuestionContainers(document);
+  function doRecord(silent, presetContainers) {
+    var containers = presetContainers || findQuestionContainers(document);
     var chapterGuess = guessChapterName();
     var chapterInput = uiDoc().getElementById('zhr-chapter-input');
     var courseName = currentCourseGuess();
     var chapterName = normWs(chapterInput ? chapterInput.value : '') || chapterGuess || '未命名章节';
 
     if (!containers.length) {
-      toast('未识别到带答案的题目块。若本页确为“成绩/查看解析”页，请点「诊断」把快照发我，或点「重新识别」后重试。', true);
+      if (!silent) toast('未识别到带答案的题目块。若本页确为“成绩/查看解析”页，请点「诊断」把快照发我，或点「重新识别」后重试。', true);
       return { ok: false, reason: 'no-containers' };
     }
 
@@ -738,7 +738,7 @@ var ZHR = (function () {
       } catch (err) { failed++; }
     }
     if (!incoming.length) {
-      toast('识别到容器但未能解析出题目（请点「诊断」把快照发我）。', true);
+      if (!silent) toast('识别到容器但未能解析出题目（请点「诊断」把快照发我）。', true);
       return { ok: false, reason: 'parse-failed' };
     }
 
@@ -748,10 +748,135 @@ var ZHR = (function () {
     saveCourse(courseName, course);
     var totalAll = course.questions.length;
 
-    toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题；该课累计 ' + totalAll + ' 题');
+    if (!silent) toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题；该课累计 ' + totalAll + ' 题');
     refreshStatBar();
     return { ok: true, added: res.added.length, variants: res.variants.length, skipped: res.skipped, failed: failed, totalAll: totalAll };
   }
+
+  /* ---------------- 自动遍历 ----------------
+   *  边界：只自动化“浏览 + 读取页面上已展示的题目/解析”，不答题、不提交。
+   *  安全：只点击白名单按钮文本，黑名单（提交/交卷/放弃/结束/删除…）一律不点。
+   */
+  var DANGER_RE = /(提交|交卷|上交|放弃|结束|删除|清空|保存并提交|确认提交|立即提交)/;
+  var BTN_VIEW_RE = /(查看解析|查看答案解析|查看答案|试题解析)/;
+  var BTN_ENTRY_RE = /(去提升|开始提升|进入提升|去练习|开始练习)/;
+  var BTN_EXIT_RE = /(退出|返回课程|返回目录|回到视频|关闭本页|关闭)/;
+  var BTN_NEXT_RE = /(下一题|下一页|下一道)/;
+
+  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [] };
+
+  function pilotLog(msg) {
+    PILOT.logs.push(new Date().toLocaleTimeString('zh-CN') + ' ' + msg);
+    if (PILOT.logs.length > 30) PILOT.logs.shift();
+    var el = uiDoc().getElementById('zhr-pilotlog');
+    if (el) el.textContent = PILOT.logs.slice(-3).join('\n');
+  }
+
+  function pilotVisible(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    var w = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    try {
+      var cs = w.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    } catch (e) { /* ignore */ }
+    return true;
+  }
+
+  /* 找可见、文本匹配白名单、且不含危险词的按钮并点击；返回被点击的文本或 null */
+  function pilotClick(re) {
+    var els = document.querySelectorAll('button,a,[role="button"],li,span,div,em,i,p');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
+      if (!pilotVisible(el)) continue;
+      var t = normWs(el.innerText || el.textContent || '');
+      if (!t || t.length > 16) continue;
+      if (DANGER_RE.test(t)) continue;
+      if (!re.test(t)) continue;
+      var inner = el.querySelector('button,a,[role="button"]');
+      if (inner && inner !== el) continue;
+      try { el.click(); return t; } catch (e2) { continue; }
+    }
+    return null;
+  }
+
+  /* 只取“屏幕上可见”的题目容器：隐藏的题（未展开的解析等）不算在内 */
+  function pilotContainers() {
+    var all = findQuestionContainers(document);
+    var out = [];
+    for (var i = 0; i < all.length; i++) if (pilotVisible(all[i])) out.push(all[i]);
+    return out;
+  }
+
+  /* 侧边目录：找“当前项(active/current/selected)”的下一项并点击 */
+  function pilotNextCatalog() {
+    var sel = '[class*="catalog" i] li,[class*="chapter" i] li,[class*="section" i] li,' +
+              '[class*="menu" i] li,[class*="nav" i] li,[class*="list" i] li,[class*="menu" i] a,[class*="nav" i] a';
+    var items = document.querySelectorAll(sel);
+    var list = [];
+    for (var i = 0; i < items.length; i++) if (pilotVisible(items[i])) list.push(items[i]);
+    if (list.length < 2) return null;
+    for (var j = 0; j < list.length; j++) {
+      if (!/(active|current|selected|checked)/i.test(clsOf(list[j]))) continue;
+      for (var k = j + 1; k < list.length; k++) {
+        var t = normWs(list[k].innerText || '');
+        if (!t || DANGER_RE.test(t) || t.length > 40) continue;
+        if (list[k].closest && list[k].closest('#zhr-root,#zhr-scout-root')) continue;
+        try { list[k].click(); return t.slice(0, 24); } catch (e) { return null; }
+      }
+    }
+    return null;
+  }
+
+  function pilotStep() {
+    if (!PILOT.running) return;
+    if (++PILOT.steps > PILOT.maxSteps) { pilotStop('已达步数上限'); return; }
+
+    /* 1) 本页有“可见”的题目/解析 → 读取，然后翻页或退出 */
+    var conts = pilotContainers();
+    if (conts.length) {
+      var r = doRecord(true, conts);
+      pilotLog('读取本页：新增 ' + ((r && r.added) || 0) + ' 题');
+      var nx = pilotClick(BTN_NEXT_RE);
+      if (nx) { pilotLog('→ 下一题（' + nx + '）'); return; }
+      var ex = pilotClick(BTN_EXIT_RE);
+      if (ex) { pilotLog('→ 退出（' + ex + '）'); return; }
+      var n1 = pilotNextCatalog();
+      if (n1) { pilotLog('→ 切换目录项（' + n1 + '）'); return; }
+      pilotLog('本页已读；未找到「下一题/退出/目录」，等待…');
+      return;
+    }
+    /* 2) 打开解析 */
+    var v = pilotClick(BTN_VIEW_RE);
+    if (v) { pilotLog('→ 查看解析（' + v + '）'); return; }
+    /* 3) 进入提升 */
+    var en = pilotClick(BTN_ENTRY_RE);
+    if (en) { pilotLog('→ 进入（' + en + '）'); return; }
+    /* 4) 切下一个目录项（视频/节点） */
+    var n2 = pilotNextCatalog();
+    if (n2) { pilotLog('→ 切换目录项（' + n2 + '）'); return; }
+    pilotLog('未找到可操作项；请手动切到下一个视频/解析页后继续');
+  }
+
+  function pilotStart() {
+    if (PILOT.running) return;
+    PILOT.running = true; PILOT.steps = 0; PILOT.logs = [];
+    pilotLog('开始自动遍历（不答题、不提交）');
+    var b = uiDoc().getElementById('zhr-b6');
+    if (b) b.textContent = '⏹ 停止遍历';
+    PILOT.timer = setInterval(pilotStep, 1600);
+  }
+  function pilotStop(reason) {
+    PILOT.running = false;
+    if (PILOT.timer) { clearInterval(PILOT.timer); PILOT.timer = null; }
+    pilotLog('已停止' + (reason ? '：' + reason : ''));
+    var b = uiDoc().getElementById('zhr-b6');
+    if (b) b.textContent = '🤖 自动遍历';
+    refreshStatBar();
+  }
+  function pilotToggle() { if (PILOT.running) pilotStop(''); else pilotStart(); }
 
   /* ---------------- 页面结构侦察（合并自原侦察脚本） ---------------- */
 
@@ -934,7 +1059,9 @@ var ZHR = (function () {
       '#zhr-b3{background:#eef1f6;color:#333}' +
       '#zhr-b4{background:#fdecea;color:#c0392b}' +
       '#zhr-b5{background:#6c5ce7;color:#fff}' +
+      '#zhr-b6{background:#e67e22;color:#fff}' +
       '#zhr-stat{margin-top:8px;color:#2f6fed;font-size:11px}' +
+      '#zhr-pilotlog{margin-top:6px;color:#666;font-size:10px;line-height:1.4;white-space:pre-wrap;max-height:54px;overflow:auto}' +
       '#zhr-tip{margin-top:6px;color:#999;font-size:11px}'
     );
 
@@ -978,7 +1105,9 @@ var ZHR = (function () {
     bClear.id = 'zhr-b4'; bClear.textContent = '清空本课';
     var bList = document.createElement('button');
     bList.id = 'zhr-b5'; bList.textContent = '📚 已记录';
-    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bClear);
+    var bAuto = document.createElement('button');
+    bAuto.id = 'zhr-b6'; bAuto.textContent = '🤖 自动遍历';
+    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bAuto); btns.appendChild(bClear);
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
@@ -986,10 +1115,12 @@ var ZHR = (function () {
 
     var stat = document.createElement('div');
     stat.id = 'zhr-stat';
+    var plog = document.createElement('div');
+    plog.id = 'zhr-pilotlog';
 
     body.appendChild(lb1); body.appendChild(courseInput);
     body.appendChild(lb2); body.appendChild(chapterInput);
-    body.appendChild(btns); body.appendChild(stat); body.appendChild(tip);
+    body.appendChild(btns); body.appendChild(stat); body.appendChild(plog); body.appendChild(tip);
     root.appendChild(head); root.appendChild(body);
     (udoc.body || udoc.documentElement).appendChild(root);
 
@@ -1034,6 +1165,7 @@ var ZHR = (function () {
     bList.addEventListener('click', function () {
       showModal('本课已记录题目（可复制保存）', '', recordedText());
     });
+    bAuto.addEventListener('click', pilotToggle);
     bClear.addEventListener('click', doClearCourse);
 
     udoc.addEventListener('keydown', function (e) {
