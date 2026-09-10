@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.8.3
+// @version      1.8.4
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.8.3';
+  var VERSION = '1.8.4';
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
   function collectErr(ev) {
@@ -183,13 +183,18 @@ var ZHR = (function () {
   }
 
   function optionsLine(q) {
+    /* 一道题的选项，一行一个（导出/查看都按行排） */
+    return optionLines(q).join('\n');
+  }
+
+  function optionLines(q) {
     var opts = q.options || [];
     var parts = [];
     for (var i = 0; i < opts.length; i++) {
       var o = opts[i];
-      parts.push((o.letter || String.fromCharCode(65 + i)) + '. ' + o.text);
+      parts.push((o.letter || String.fromCharCode(65 + i)) + '. ' + String(o.text || '').trim());
     }
-    return parts.join('　');
+    return parts;
   }
 
   /* doc: { course: String, sections: [{name:String, questions:[{stem,type,options,answer}]}] } */
@@ -205,8 +210,8 @@ var ZHR = (function () {
         var t = typeLabel(q.type);
         var body = qn + (t ? '【' + t + '】' : '') + (q.stem || '');
         paraXml += wPara(wRun(body, { size: 21 }), 40);
-        var ol = optionsLine(q);
-        if (ol) paraXml += wPara(wRun(ol, { size: 21 }), 40);
+        var ols = optionLines(q);
+        for (var oi = 0; oi < ols.length; oi++) paraXml += wPara(wRun('\u3000' + ols[oi], { size: 21 }), 20);
         paraXml += wPara(wRun('【答案】' + (q.answer || '未记录'), { bold: true, color: '1F6F43', size: 21 }), 160);
       });
     });
@@ -598,6 +603,75 @@ var ZHR = (function () {
     return { stem: cleanText(stemLines.join(' ')), options: opts };
   }
 
+  /* 只有字母、没有文字的行（如 "A." / "A" / "（A）"） */
+  var LETTER_ONLY_RE = /^[（(]?\s*([A-Ha-hＡ-Ｈａ-ｈ])\s*[)）.．、:：]?$/;
+  /* 短词（被拆散到一边的选项文字） */
+  var SHORT_WORD_RE = /^[\w\u4e00-\u9fa5'’\-]{1,20}$/;
+
+  /* 预处理：把“字母块 + 文字块”还原成 “A. text”
+     （真机上字母与文字常被排成两块：字母整块在一边、文字在另一边） */
+  function pairSplitOptions(lines) {
+    var out = lines.slice();
+    for (var i = 0; i < out.length; i++) {
+      if (!out[i] || !LETTER_ONLY_RE.test(out[i])) continue;
+      var letters = [];
+      var j = i;
+      while (j < out.length) {
+        var mj = out[j] && out[j].match(LETTER_ONLY_RE);
+        if (!mj) break;
+        var lj = normLetter(mj[1]).toUpperCase();
+        if (lj !== String.fromCharCode(65 + letters.length)) break;
+        letters.push(lj);
+        j++;
+      }
+      if (letters.length < 2) continue;
+      var n = letters.length;
+      var texts = [], usedFrom = -1, usedTo = -1;
+      /* (a) 后面紧跟的 n 行就是文字 */
+      if (j + n <= out.length) {
+        var ok = true, buf = [];
+        for (var k = j; k < j + n; k++) {
+          var tk = out[k];
+          if (!tk || ANSWER_LINE_RE.test(tk) || STATUS_LINE_RE.test(tk) || QNUM_LINE_RE.test(tk) || LETTER_ONLY_RE.test(tk) || OPT_RE.test(tk)) { ok = false; break; }
+          buf.push(tk);
+        }
+        if (ok) { texts = buf; usedFrom = j; usedTo = j + n; }
+      }
+      /* (b) 后面只有一行，且恰好能拆成 n 个短词 */
+      if (!texts.length) {
+        var t1 = out[j];
+        if (t1 && !ANSWER_LINE_RE.test(t1) && !STATUS_LINE_RE.test(t1) && !OPT_RE.test(t1) && !LETTER_ONLY_RE.test(t1)) {
+          var ws = t1.split(/\s+/).filter(Boolean);
+          var allW = ws.length === n;
+          for (var w1 = 0; w1 < ws.length && allW; w1++) if (!SHORT_WORD_RE.test(ws[w1])) allW = false;
+          if (allW) { texts = ws; usedFrom = j; usedTo = j + 1; }
+        }
+      }
+      /* (c) 上一行的“结尾几个短词”就是文字（题干与选项文字挤在同一行） */
+      if (!texts.length && i > 0) {
+        var pv = out[i - 1];
+        if (pv && !ANSWER_LINE_RE.test(pv) && !STATUS_LINE_RE.test(pv) && !OPT_RE.test(pv)) {
+          var pw = pv.split(/\s+/).filter(Boolean);
+          if (pw.length > n) {
+            var tail = pw.slice(pw.length - n);
+            var rest = pw.slice(0, pw.length - n).join(' ').trim();
+            var tailOk = true;
+            for (var q2 = 0; q2 < tail.length; q2++) if (!SHORT_WORD_RE.test(tail[q2])) { tailOk = false; break; }
+            if (tailOk && (rest === '' || /[）)＿_。？?.．、：:]\s*$/.test(rest))) {
+              texts = tail;
+              out[i - 1] = rest;                 /* 从题干里把选项词拿掉 */
+            }
+          }
+        }
+      }
+      if (!texts.length) continue;
+      for (var x = 0; x < n; x++) out[i + x] = letters[x] + '. ' + texts[x];
+      if (usedFrom >= 0) for (var y = usedFrom; y < usedTo; y++) out[y] = '';
+      i = j - 1;                                  /* 继续扫后面的内容 */
+    }
+    return out.filter(function (t) { return !!t; });
+  }
+
   /* 从一个题目容器的行文本里解析题干/选项/答案（行文本模型，兼容多数布局） */
   function parseLines(containerText) {
     var raw = splitLines(containerText);
@@ -606,6 +680,7 @@ var ZHR = (function () {
       var parts = splitInlineOptions(raw[e]);
       for (var p = 0; p < parts.length; p++) lines.push(parts[p]);
     }
+    lines = pairSplitOptions(lines);      /* 字母块 / 文字块 先配对好 */
     var stemLines = [], options = [], bareOpts = [], ansText = '', ansLineIdx = -1, pendingOpts = null;
     for (var i = 0; i < lines.length; i++) {
       var L = lines[i];
@@ -1202,7 +1277,7 @@ var ZHR = (function () {
         out.push('【' + sec.name + '】');
         sec.questions.forEach(function (q, j) {
           out.push((j + 1) + '. ' + q.stem);
-          if (q.options && q.options.length) out.push('   ' + optionsLine(q));
+          if (q.options && q.options.length) optionLines(q).forEach(function (l) { out.push('   ' + l); });
           out.push('   答案：' + (q.answer || '未记录'));
         });
       });

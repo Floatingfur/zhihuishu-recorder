@@ -153,5 +153,30 @@ ok('题干以“A ”开头（英文）→ 不被误认成选项', () => {
   assert.strictEqual(o4.options.map(o => o.text).join('/'), '对/错');
 });
 
+/* 字母块 / 文字块 被拆开时的配对（v1.8.4：真机样张） */
+console.log('== 字母块 / 文字块 配对 ==');
+const o5 = Z.parseLines('11. The combining form “typhl/o” is used to denote ______. （ ） cecum appendix colon rectum\nA.\nB.\nC.\nD.\n参考答案：A');
+ok('题干行尾夹带选项文字 + 字母块 → 一一配对，题干不含选项词', () => {
+  assert.strictEqual(o5.stem, 'The combining form “typhl/o” is used to denote ______. （ ）');
+  assert.strictEqual(o5.options.map(o => o.letter + '.' + o.text).join(' | '), 'A.cecum | B.appendix | C.colon | D.rectum');
+});
+
+const o6 = Z.parseLines('13. _____________ refers to the localized death of living cells. （ ） Necrosis Strangulation Sclerosis Emesis\nA.\nB.\nC.\nD.\n参考答案：A');
+ok('同上的另一道真题 → 4 个选项都对上', () => {
+  assert.strictEqual(o6.stem, '_____________ refers to the localized death of living cells. （ ）');
+  assert.strictEqual(o6.options.map(o => o.text).join('/'), 'Necrosis/Strangulation/Sclerosis/Emesis');
+});
+
+const o7 = Z.parseLines('1. 患者的主诉是（ ）\nA.\nB.\nC.\nD.\n头痛\n头晕\n恶心\n呕吐\n参考答案：B');
+ok('字母块在前、文字在后面的 4 行 → 按顺序配对', () => {
+  assert.strictEqual(o7.stem, '患者的主诉是（ ）');
+  assert.strictEqual(o7.options.map(o => o.letter + '.' + o.text).join(' | '), 'A.头痛 | B.头晕 | C.恶心 | D.呕吐');
+});
+
+const o8 = Z.parseLines('1. 下列哪项正确（ ）\nA. 甲\nB. 乙\nC. 丙\nD. 丁\n参考答案：C');
+ok('常规“A. 文字”不受预处理影响', () => {
+  assert.strictEqual(o8.options.map(o => o.text).join('/'), '甲/乙/丙/丁');
+});
+
 console.log(passed + ' 项通过');
 if (process.exitCode) { console.error('存在失败用例'); }
