@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.8.2
+// @version      1.8.3
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.8.2';
+  var VERSION = '1.8.3';
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
   function collectErr(ev) {
@@ -1922,6 +1922,30 @@ var ZHR = (function () {
     toast('已生成 Word 文档：' + a.download + '（若浏览器拦截下载请允许）');
   }
 
+  /* 清空整个题库（v1.8.3）：把历史遗留/调试用的题目一次清掉，并阻止旧 v1 分库再被迁入 */
+  function doClearBank() {
+    var bank = ensureBank();
+    var n = bank.questions.length;
+    if (!n) { toast('题库已经空了。', true); return; }
+    var courses = {};
+    for (var i = 0; i < bank.questions.length; i++) courses[bank.questions[i].course || '未命名课程'] = 1;
+    var nCourse = Object.keys(courses).length;
+    if (!window.confirm('确定清空【整个题库】的 ' + n + ' 题（' + nCourse + ' 个课程标签）？此操作不可恢复。\n如需保留，请先点「📚 已记录」把内容复制备份。')) return;
+    if (!window.confirm('再次确认：真的要全部清空吗？')) return;
+    saveBank({ questions: [] });
+    sSet(K_MIGRATED, '1');            /* 别再自动导入旧 v1 的分库数据（否则清完又回来） */
+    sSet(K_UI_COURSE, '');
+    sSet(K_UI_CHAPTER, '');
+    sSet(K_UI_COURSE_MANUAL, '');
+    sSet(K_UI_CHAPTER_MANUAL, '');
+    var ci = uiDoc().getElementById('zhr-course-input');
+    var hi = uiDoc().getElementById('zhr-chapter-input');
+    if (ci) ci.value = '';
+    if (hi) hi.value = '';
+    refreshStatBar();
+    toast('已清空整个题库（删了 ' + n + ' 题）');
+  }
+
   function doClearCourse() {
     var courseName = currentCourseGuess();
     if (!courseName) { toast('未确定课程名。', true); return; }
@@ -1986,6 +2010,7 @@ var ZHR = (function () {
       '#zhr-b4{background:#fdecea;color:#c0392b}' +
       '#zhr-b5{background:#6c5ce7;color:#fff}' +
       '#zhr-b6{background:#e67e22;color:#fff}' +
+      '#zhr-b7{background:#fdecea;color:#a93226}' +
       '#zhr-stat{margin-top:8px;color:#2f6fed;font-size:11px}' +
       '#zhr-pilotlog{margin-top:6px;color:#666;font-size:10px;line-height:1.4;white-space:pre-wrap;max-height:54px;overflow:auto}' +
       '#zhr-tip{margin-top:6px;color:#999;font-size:11px}'
@@ -2033,7 +2058,9 @@ var ZHR = (function () {
     bList.id = 'zhr-b5'; bList.textContent = '📚 已记录';
     var bAuto = document.createElement('button');
     bAuto.id = 'zhr-b6'; bAuto.textContent = '🤖 自动遍历';
-    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bAuto); btns.appendChild(bClear);
+    var bWipe = document.createElement('button');
+    bWipe.id = 'zhr-b7'; bWipe.textContent = '🧹 清空题库';
+    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bAuto); btns.appendChild(bClear); btns.appendChild(bWipe);
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
@@ -2122,6 +2149,7 @@ var ZHR = (function () {
     });
     bAuto.addEventListener('click', pilotToggle);
     bClear.addEventListener('click', doClearCourse);
+    bWipe.addEventListener('click', doClearBank);
 
     udoc.addEventListener('keydown', function (e) {
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyX') { e.preventDefault(); doRecord(); }
