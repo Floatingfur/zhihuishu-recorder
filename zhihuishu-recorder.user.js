@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.7.5
+// @version      1.8.0
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.7.4';
+  var VERSION = '1.8.0';
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
   function collectErr(ev) {
@@ -287,6 +287,7 @@ var ZHR = (function () {
           type: inc.type || 'other',
           options: (inc.options || []).slice(),
           answer: inc.answer || '',
+          course: inc.course || '',
           chapter: inc.chapter || '',
           firstSeen: Date.now(),
           updatedAt: Date.now()
@@ -305,6 +306,7 @@ var ZHR = (function () {
       if (matched !== null) {
         skipped++;
         list[matched].updatedAt = Date.now();
+        if (!list[matched].course && inc.course) list[matched].course = inc.course;
         if (inc.answer && inc.answer !== list[matched].answer) { list[matched].answer = inc.answer; }
         return;
       }
@@ -314,6 +316,7 @@ var ZHR = (function () {
         type: inc.type || 'other',
         options: (inc.options || []).slice(),
         answer: inc.answer || '',
+        course: inc.course || '',
         chapter: inc.chapter || '',
         variantOf: true,
         firstSeen: Date.now(),
@@ -336,6 +339,30 @@ var ZHR = (function () {
       byChapter[ch].push({ stem: q.stem, type: q.type, options: q.options, answer: q.answer });
     });
     return { course: course.name, sections: order.map(function (n) { return { name: n, questions: byChapter[n] }; }) };
+  }
+
+  /* 单题库 → 按 课程 → 章节 分组（当前课程排最前），供 Word 排版 */
+  function bankToDoc(bank, focus) {
+    var order = [], by = {};
+    (bank.questions || []).forEach(function (q) {
+      var c = q.course || '未命名课程';
+      if (!by[c]) { by[c] = []; order.push(c); }
+      by[c].push(q);
+    });
+    order.sort(function (a, b) {
+      if (a === focus && b !== focus) return -1;
+      if (b === focus && a !== focus) return 1;
+      return 0;
+    });
+    var sections = [];
+    order.forEach(function (c) {
+      var sub = coursesToDoc({ name: c, questions: by[c] });
+      (sub.sections || []).forEach(function (s) {
+        sections.push({ name: order.length > 1 ? ('【' + c + '】' + s.name) : s.name, questions: s.questions });
+      });
+    });
+    var title = order.length > 1 ? ('智慧树题库（' + order.length + ' 门课）') : (order[0] || '智慧树题库');
+    return { course: title, sections: sections };
   }
 
   /* ================================================================
@@ -932,70 +959,130 @@ var ZHR = (function () {
     sSet(K_INDEX, JSON.stringify(list));
   }
 
+  /* ---------------- 题库（v2：单一题库，不再按课程名分库） ----------------
+   *  v1 把题目存在 "zhr.v1.course.<课程名哈希>" 里，课程名识别一变就开到另一个"空库"，
+   *  看上去像"记录被清空了"。v2 改成全局一个库，课程名/章节名只是每题身上的**标签**，
+   *  所以换视频 / 换页面 / 识别到的课程名变化，都不会丢题目。
+   */
+  var K_BANK = 'zhr.v2.bank';
+  var K_MIGRATED = 'zhr.v2.migrated';
+
+  function ensureBank() {
+    var bank = null;
+    try { bank = JSON.parse(sGet(K_BANK) || 'null'); } catch (e) { bank = null; }
+    if (!bank || typeof bank !== 'object') bank = { questions: [] };
+    if (!bank.questions) bank.questions = [];
+    if (sGet(K_MIGRATED) !== '1') {
+      /* 把 v1 的分库数据（含更早的 chapters 结构）搬进来；旧键保留不删，安全可回退 */
+      try {
+        var list = loadCourseList();
+        for (var i = 0; i < list.length; i++) {
+          var old = loadCourse(list[i].name);
+          if (!old || !old.questions || !old.questions.length) continue;
+          var qs = [];
+          for (var j = 0; j < old.questions.length; j++) {
+            var q = old.questions[j];
+            qs.push({
+              stem: q.stem, type: q.type, options: q.options, answer: q.answer,
+              course: q.course || list[i].name || '', chapter: q.chapter || ''
+            });
+          }
+          bank.questions = mergeQuestions(bank.questions, qs).list;
+        }
+      } catch (e2) { /* 迁移出错不影响使用 */ }
+      sSet(K_MIGRATED, '1');
+      sSet(K_BANK, JSON.stringify(bank));
+    }
+    return bank;
+  }
+  function saveBank(bank) { sSet(K_BANK, JSON.stringify(bank)); }
+  function bankQuestions() { return ensureBank().questions || []; }
+
   /* ---------------- 核心动作 ---------------- */
 
   /* 面板状态记忆：课程名/章节名持久化，切换界面（页面重载）后自动恢复；
-     只有点「清空本课」才清除。
-     重要：课程名是题库的键，识别波动会导致"看上去记录被清空"，
-     所以这里加了锚点规则（见 resolveCourseName），绝不会因为识别到别的名字就换库。 */
-  var COURSE_HINT = '';
+     只有点「清空本课」才清除（且只清当前课程标签的那些题）。
+     题目存在**单一题库**里，课程名只是标签，所以换视频/换页面都不会丢记录。 */
 
-  /* 某门课已有多少题（用于"有记录的课程优先"） */
+  /* 某门课在题库里有多少题 */
   function courseRecordsCount(name) {
     if (!name) return 0;
-    var c = null;
-    try { c = loadCourse(name); } catch (e) { return 0; }
-    return c && c.questions ? c.questions.length : 0;
+    var qs = null;
+    try { qs = bankQuestions(); } catch (e) { return 0; }
+    var n = 0;
+    for (var i = 0; i < qs.length; i++) if (qs[i].course === name) n++;
+    return n;
   }
 
-  /* 其它课程里的记录概览（当前课为空时提示用户记录在哪） */
+  /* 其它课程标签的记录概览 */
   function otherCoursesText(exceptName) {
-    var list = loadCourseList();
-    var parts = [];
-    for (var i = 0; i < list.length && parts.length < 4; i++) {
-      if (list[i].name === exceptName) continue;
-      var n = courseRecordsCount(list[i].name);
-      if (n) parts.push(list[i].name + '(' + n + '题)');
+    var qs = null;
+    try { qs = bankQuestions(); } catch (e) { return ''; }
+    var count = {}, order = [];
+    for (var i = 0; i < qs.length; i++) {
+      var c = qs[i].course || '未命名课程';
+      if (c === exceptName) continue;
+      if (!(c in count)) { count[c] = 0; order.push(c); }
+      count[c]++;
     }
+    var parts = [];
+    for (var k = 0; k < order.length && parts.length < 4; k++) parts.push(order[k] + '(' + count[order[k]] + '题)');
     return parts.join('、');
   }
 
   function statText() {
+    var qs = bankQuestions();
     var name = currentCourseGuess();
-    var c = loadCourse(name);
-    var hint = COURSE_HINT ? '　⚠ ' + COURSE_HINT : '';
-    if (!c || !c.questions.length) {
-      var others = otherCoursesText(name);
-      return '本课暂无记录（做完一章在解析页点「开始记录」）' + (others ? '；其它课程：' + others : '') + hint;
+    if (!qs.length) return '题库暂无记录（做完一章在解析页点「开始记录」）';
+    var mine = 0, chs = {};
+    for (var i = 0; i < qs.length; i++) {
+      if (qs[i].course !== name) continue;
+      mine++;
+      chs[qs[i].chapter || '未命名章节'] = 1;
     }
-    var chs = {};
-    c.questions.forEach(function (q) { chs[q.chapter || '未命名章节'] = 1; });
-    return '本课已记录 ' + c.questions.length + ' 题，覆盖 ' + Object.keys(chs).length + ' 个章节' + hint;
+    var head = '题库共 ' + qs.length + ' 题';
+    if (!mine) {
+      var others = otherCoursesText(name);
+      return head + '；本课（' + (name || '未命名课程') + '）0 题' + (others ? '，其它：' + others : '');
+    }
+    return head + '；本课已记录 ' + mine + ' 题，覆盖 ' + Object.keys(chs).length + ' 个章节';
   }
   function refreshStatBar() {
     var el = uiDoc().getElementById('zhr-stat');
     if (el) el.textContent = statText();
   }
   function recordedText() {
-    var cur = currentCourseGuess();
-    var c = loadCourse(cur);
-    if (!c || !c.questions.length) {
-      var others = otherCoursesText(cur);
-      return '（本课暂无记录）\n做完一章、进入「本次成绩/查看解析」页后点「▶ 开始记录」即可累积。' +
-        (others ? '\n\n其它课程里已有记录：' + others + '\n（把上面的课程名框改成对应课程名即可查看/导出）' : '');
+    var qs = bankQuestions();
+    var focus = currentCourseGuess();
+    if (!qs.length) return '（题库暂无记录）\n做完一章、进入「本次成绩/查看解析」页后点「▶ 开始记录」即可累积。';
+    var order = [], by = {};
+    for (var i = 0; i < qs.length; i++) {
+      var c = qs[i].course || '未命名课程';
+      if (!by[c]) { by[c] = []; order.push(c); }
+      by[c].push(qs[i]);
     }
-    var doc = coursesToDoc(c);
-    var out = [];
-    out.push('课程：' + (c.name || '未命名课程') + '　合计 ' + c.questions.length + ' 题');
-    doc.sections.forEach(function (sec) {
-      out.push('');
-      out.push('【' + sec.name + '】');
-      sec.questions.forEach(function (q, i) {
-        out.push((i + 1) + '. ' + q.stem);
-        if (q.options && q.options.length) out.push('   ' + optionsLine(q));
-        out.push('   答案：' + (q.answer || '未记录'));
-      });
+    order.sort(function (a, b) {
+      if (a === focus && b !== focus) return -1;
+      if (b === focus && a !== focus) return 1;
+      return 0;
     });
+    var out = [];
+    out.push('题库共 ' + qs.length + ' 题，' + order.length + ' 个课程标签' + (focus ? '（当前：' + focus + '）' : ''));
+    for (var k = 0; k < order.length; k++) {
+      var name = order[k];
+      var doc = coursesToDoc({ name: name, questions: by[name] });
+      out.push('');
+      out.push('════ ' + name + '（' + by[name].length + ' 题）════');
+      doc.sections.forEach(function (sec) {
+        out.push('');
+        out.push('【' + sec.name + '】');
+        sec.questions.forEach(function (q, j) {
+          out.push((j + 1) + '. ' + q.stem);
+          if (q.options && q.options.length) out.push('   ' + optionsLine(q));
+          out.push('   答案：' + (q.answer || '未记录'));
+        });
+      });
+    }
     return out.join('\n');
   }
 
@@ -1010,11 +1097,9 @@ var ZHR = (function () {
     return v;
   }
 
-  /* 课程名解析规则（关键：绝不因为识别波动就把记录换个地方）
-     1) 手改过 → 以手改为准；
-     2) 识别到含「学年/学期」的名字（课程名典型形态）→ 直接采用；
-     3) 否则优先"已有记录"的那个课程名 → 防止切页后看起来记录被清空；
-     4) 都没有 → 用识别值（次选记忆值）。 */
+  /* 课程名解析（v1.8.0：课程名只是题库里的“标签”，不再决定题目存在哪）
+     手改 → 以手改为准；否则识别到含「学年/学期」的名字（课程名典型形态）就用它；
+     再否则用面板里现有的值（保持稳定不抽动），最后才用识别值。 */
   function resolveCourseName() {
     var manual = sGet(K_UI_COURSE_MANUAL) === '1';
     var saved = sGet(K_UI_COURSE) || '';
@@ -1022,10 +1107,8 @@ var ZHR = (function () {
     var typed = normWs(inp ? inp.value : '');
     if (manual) return typed || saved;
     var guess = guessCourseNameCached();
-    if (/(学年|学期)/.test(guess)) return guess;
-    if (typed && courseRecordsCount(typed)) return typed;
-    if (saved && courseRecordsCount(saved)) return saved;
-    return guess || typed || saved;
+    if (guess && /(学年|学期)/.test(guess)) return guess;
+    return typed || saved || guess;
   }
 
   function currentCourseGuess() {
@@ -1063,13 +1146,16 @@ var ZHR = (function () {
       return { ok: false, reason: 'parse-failed' };
     }
 
-    var course = loadCourse(courseName) || { name: courseName, questions: [] };
-    var res = mergeQuestions(course.questions, incoming);
-    course.questions = res.list;
-    saveCourse(courseName, course);
-    var totalAll = course.questions.length;
+    var bank = ensureBank();
+    for (var n = 0; n < incoming.length; n++) incoming[n].course = courseName;
+    var res = mergeQuestions(bank.questions, incoming);
+    bank.questions = res.list;
+    saveBank(bank);
+    var totalAll = bank.questions.length;
+    var mineAll = 0;
+    for (var m = 0; m < bank.questions.length; m++) if (bank.questions[m].course === courseName) mineAll++;
 
-    if (!silent) toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题' + (cardSkipped ? '，跳过答题卡 ' + cardSkipped + ' 块' : '') + (noiseSkipped ? '，跳过标题/无效块 ' + noiseSkipped + ' 块' : '') + '；该课累计 ' + totalAll + ' 题');
+    if (!silent) toast('已记录：' + courseName + ' › ' + chapterName + '\n新增 ' + res.added.length + ' 题，变体 ' + res.variants.length + ' 题，重复跳过 ' + res.skipped + ' 题，解析失败 ' + failed + ' 题' + (cardSkipped ? '，跳过答题卡 ' + cardSkipped + ' 块' : '') + (noiseSkipped ? '，跳过标题/无效块 ' + noiseSkipped + ' 块' : '') + '；题库累计 ' + totalAll + ' 题（本课 ' + mineAll + ' 题）');
     refreshStatBar();
     return { ok: true, added: res.added.length, variants: res.variants.length, skipped: res.skipped, failed: failed, totalAll: totalAll };
   }
@@ -1625,15 +1711,19 @@ var ZHR = (function () {
 
   function doExportWord() {
     var courseName = currentCourseGuess();
-    if (!courseName) { toast('未能确定课程名，请在面板课程框里手动填写。', true); return; }
-    var course = loadCourse(courseName);
-    if (!course) { toast('该课程还没有任何记录，先做一章点「开始记录」。', true); return; }
-    var bytes = buildDocx(coursesToDoc(course));
+    var bank = ensureBank();
+    if (!bank.questions.length) { toast('题库还没有任何记录，先做一章点「开始记录」。', true); return; }
+    var courses = {};
+    for (var i = 0; i < bank.questions.length; i++) courses[bank.questions[i].course || '未命名课程'] = 1;
+    var nCourse = Object.keys(courses).length;
+    var doc = bankToDoc(bank, courseName);
+    if (nCourse < 2 && courseName) doc.course = courseName;
+    var bytes = buildDocx(doc);
     var blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;
-    a.download = (courseName || '智慧树题库') + '.docx';
+    a.download = (nCourse < 2 ? (courseName || '智慧树题库') : ('智慧树题库-' + nCourse + '门课')) + '.docx';
     document.documentElement.appendChild(a);
     a.click();
     setTimeout(function () {
@@ -1646,11 +1736,17 @@ var ZHR = (function () {
   function doClearCourse() {
     var courseName = currentCourseGuess();
     if (!courseName) { toast('未确定课程名。', true); return; }
-    if (!window.confirm('确定清空课程「' + courseName + '」的全部记录？此操作不可恢复。')) return;
-    if (!window.confirm('再次确认：真的要清空吗？')) return;
-    sSet(courseKeyFor(courseName), 'null');
-    var list = loadCourseList().filter(function (c) { return c.name !== courseName; });
-    sSet(K_INDEX, JSON.stringify(list));
+    var bank = ensureBank();
+    var kept = [], mine = 0;
+    for (var i = 0; i < bank.questions.length; i++) {
+      if (bank.questions[i].course === courseName) mine++;
+      else kept.push(bank.questions[i]);
+    }
+    if (!mine) { toast('当前课程「' + courseName + '」在题库里没有记录。', true); return; }
+    if (!window.confirm('确定清空课程「' + courseName + '」的 ' + mine + ' 题记录？此操作不可恢复。\n（题库里其它课程的 ' + kept.length + ' 题不受影响）')) return;
+    if (!window.confirm('再次确认：真的要清空这 ' + mine + ' 题吗？')) return;
+    bank.questions = kept;
+    saveBank(bank);
     /* 面板记忆也一并清除，回到自动识别状态 */
     sSet(K_UI_COURSE, '');
     sSet(K_UI_CHAPTER, '');
@@ -1661,7 +1757,7 @@ var ZHR = (function () {
     if (ci) ci.value = '';
     if (hi) hi.value = '';
     refreshStatBar();
-    toast('已清空课程：' + courseName);
+    toast('已清空课程：' + courseName + '（删了 ' + mine + ' 题，题库还剩 ' + kept.length + ' 题）');
   }
 
   function addStyleTo(doc, css) {
@@ -1701,7 +1797,6 @@ var ZHR = (function () {
       '#zhr-b4{background:#fdecea;color:#c0392b}' +
       '#zhr-b5{background:#6c5ce7;color:#fff}' +
       '#zhr-b6{background:#e67e22;color:#fff}' +
-      '#zhr-b7{background:#0f9d8f;color:#fff}' +
       '#zhr-stat{margin-top:8px;color:#2f6fed;font-size:11px}' +
       '#zhr-pilotlog{margin-top:6px;color:#666;font-size:10px;line-height:1.4;white-space:pre-wrap;max-height:54px;overflow:auto}' +
       '#zhr-tip{margin-top:6px;color:#999;font-size:11px}'
@@ -1749,13 +1844,11 @@ var ZHR = (function () {
     bList.id = 'zhr-b5'; bList.textContent = '📚 已记录';
     var bAuto = document.createElement('button');
     bAuto.id = 'zhr-b6'; bAuto.textContent = '🤖 自动遍历';
-    var bNext = document.createElement('button');
-    bNext.id = 'zhr-b7'; bNext.textContent = '⏭ 下一个（测试）';
-    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bAuto); btns.appendChild(bNext); btns.appendChild(bClear);
+    btns.appendChild(bRec); btns.appendChild(bWord); btns.appendChild(bDiag); btns.appendChild(bList); btns.appendChild(bAuto); btns.appendChild(bClear);
 
     var tip = document.createElement('div');
     tip.id = 'zhr-tip';
-    tip.textContent = '自动遍历顺序：去提升 → 查看解析 → 读取 → 退出 → 切下一个视频。课程名/章节名自动识别，手改后以你改的为准；记录只在点「清空本课」时清除，换页面/切章节都不会丢。';
+    tip.textContent = '自动遍历顺序：去提升 → 查看解析 → 读取 → 退出 → 切下一个视频。题目全部存在同一个题库里（课程名/章节名只是标签），换视频、换页面都不会丢；只有点「清空本课」才会删。';
 
     var stat = document.createElement('div');
     stat.id = 'zhr-stat';
@@ -1775,7 +1868,7 @@ var ZHR = (function () {
     var savedCourse = sGet(K_UI_COURSE) || '';
     var savedChapter = sGet(K_UI_CHAPTER) || '';
     /* 有记录的记忆课程名优先：避免这次识别波动 → 看上去"记录被清空" */
-    var initCourse = (savedCourse && courseRecordsCount(savedCourse)) ? savedCourse : (guessCourseNameCached() || savedCourse);
+    var initCourse = savedCourse || guessCourseNameCached();
     courseInput.value = manualCourse ? (savedCourse || initCourse) : initCourse;
     chapterInput.value = manualChapter ? savedChapter : (guessChapterName() || savedChapter);
     if (!manualCourse && courseInput.value) sSet(K_UI_COURSE, courseInput.value);
@@ -1797,14 +1890,8 @@ var ZHR = (function () {
       try {
         if (document.activeElement === courseInput || document.activeElement === chapterInput) { refreshStatBar(); return; }
         if (sGet(K_UI_COURSE_MANUAL) !== '1') {
-          var gc = guessCourseName();
           var keep = resolveCourseName();
-          COURSE_HINT = '';
-          if (gc && keep && gc !== keep) COURSE_HINT = '识别到「' + gc + '」但它没有记录，已保持当前课程；要切换请直接改上面的课程名框';
           if (keep && keep !== courseInput.value) { courseInput.value = keep; sSet(K_UI_COURSE, keep); }
-          else if (!keep && gc) { courseInput.value = gc; sSet(K_UI_COURSE, gc); }
-        } else {
-          COURSE_HINT = '';
         }
         if (sGet(K_UI_CHAPTER_MANUAL) !== '1') {
           var gh = guessChapterName();
@@ -1845,13 +1932,6 @@ var ZHR = (function () {
       showModal('本课已记录题目（可复制保存）', '', recordedText());
     });
     bAuto.addEventListener('click', pilotToggle);
-    bNext.addEventListener('click', function () {
-      /* 手动切下一个：当场验证目录识别，日志会写出找到多少目录项 */
-      if (!PILOT.running) { PILOT.catalogIdx = null; PILOT.catalogCache = null; }
-      var t = pilotNextCatalog();
-      if (t) pilotLog('（手动）→ 下个视频/节点（' + t + '）');
-      else pilotLog('（手动）没找到可切的目录项 → ' + pilotCatalogStats());
-    });
     bClear.addEventListener('click', doClearCourse);
 
     udoc.addEventListener('keydown', function (e) {
