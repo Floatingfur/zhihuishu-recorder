@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.7.1
+// @version      1.7.2
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.7.1';
+  var VERSION = '1.7.2';
 
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
@@ -969,7 +969,7 @@ var ZHR = (function () {
   var BTN_NEXT_RE = /(下一题|下一页|下一道)/;
   var CLOSE_SIG_RE = /(close|exit|back|关闭|退出|返回)/i;
 
-  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, emptyInThisVideo: false, emptyRounds: 0, catalogExhausted: false, lastAction: '', sameAction: 0 };
+  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, videoDone: false, catalogExhausted: false, lastAction: '', sameAction: 0 };
 
   function pilotLog(msg) {
     PILOT.logs.push(new Date().toLocaleTimeString('zh-CN') + ' ' + msg);
@@ -1133,40 +1133,39 @@ var ZHR = (function () {
     if (!PILOT.running) return;
     if (++PILOT.steps > PILOT.maxSteps) { pilotStop('已达步数上限'); return; }
 
-    /* 1) 本页有可见题目 → 读取 */
+    /* 1) 本页有可见题目 → 读取（一个视频只进一次提升） */
     var conts = pilotContainers();
     if (conts.length) {
       var r = doRecord(true, conts) || {};
       var added = r.added || 0;
       pilotLog('读取本页：新增 ' + added + ' 题');
+      PILOT.idle = 0;
       if (added > 0) {
-        PILOT.emptyInThisVideo = false;
-        PILOT.emptyRounds = 0;
-        PILOT.idle = 0;
         PILOT.lastAction = '';
         PILOT.sameAction = 0;
         var nx = pilotClick(BTN_NEXT_RE, 16);
         if (nx) { pilotLog('→ 下一题（' + nx + '）'); return; }
-      } else {
-        /* 新增 0 题：本视频的提升已读完，退出后不再重复进入 */
-        PILOT.emptyInThisVideo = true;
-        PILOT.emptyRounds = (PILOT.emptyRounds || 0) + 1;
-        if (PILOT.emptyRounds >= 3) { pilotStop('连续 3 个提升均为空，已停止'); return; }
       }
+      /* 读完（或全是重复）→ 退出；本视频不再重复进入 */
       var ex = pilotClick(BTN_EXIT_RE, 20) || pilotClickIcon(CLOSE_SIG_RE);
-      if (ex) { PILOT.idle = 0; pilotLog('→ 退出（' + ex + '）'); return; }
+      if (ex) {
+        PILOT.videoDone = true;
+        pilotLog('→ 退出（' + ex + '），本视频完成，接着切下一个');
+        return;
+      }
       PILOT.idle = (PILOT.idle || 0) + 1;
       pilotLog('本页已读，但未找到「退出」按钮（' + PILOT.idle + '/3）');
       if (PILOT.idle >= 3) pilotStop('找不到退出按钮');
       return;
     }
 
-    /* 2) 刚读完一个视频的提升 → 直接切下一个视频/节点 */
-    if (PILOT.emptyInThisVideo) {
-      PILOT.emptyInThisVideo = false;
+    /* 2) 刚退出上一个提升 → 先切下一个视频/节点，再继续点它的「去提升」 */
+    if (PILOT.videoDone) {
+      PILOT.videoDone = false;
       var n0 = pilotNextCatalog();
-      if (n0) { PILOT.idle = 0; pilotLog('→ 下个视频/节点（' + n0 + '）'); return; }
-      if (PILOT.catalogExhausted) { pilotStop('已遍历到最后一个视频'); return; }
+      if (n0) { PILOT.idle = 0; pilotLog('→ 下一个视频/节点（' + n0 + '）'); return; }
+      if (PILOT.catalogExhausted) { pilotStop('已遍历完课程（最后一个视频已完成）'); return; }
+      /* 识别不到目录：继续往下尝试 */
     }
 
     /* 3) 打开解析 */
@@ -1193,8 +1192,7 @@ var ZHR = (function () {
     PILOT.logs = [];
     PILOT.idle = 0;
     PILOT.catalogIdx = null;
-    PILOT.emptyInThisVideo = false;
-    PILOT.emptyRounds = 0;
+    PILOT.videoDone = false;
     PILOT.catalogExhausted = false;
     PILOT.lastAction = '';
     PILOT.sameAction = 0;
