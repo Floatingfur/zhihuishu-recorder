@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.7.0
+// @version      1.7.1
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.7.0';
+  var VERSION = '1.7.1';
 
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
@@ -969,7 +969,7 @@ var ZHR = (function () {
   var BTN_NEXT_RE = /(下一题|下一页|下一道)/;
   var CLOSE_SIG_RE = /(close|exit|back|关闭|退出|返回)/i;
 
-  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, emptyInThisVideo: false, emptyRounds: 0, catalogExhausted: false };
+  var PILOT = { running: false, timer: null, steps: 0, maxSteps: 400, logs: [], idle: 0, catalogIdx: null, emptyInThisVideo: false, emptyRounds: 0, catalogExhausted: false, lastAction: '', sameAction: 0 };
 
   function pilotLog(msg) {
     PILOT.logs.push(new Date().toLocaleTimeString('zh-CN') + ' ' + msg);
@@ -1017,17 +1017,19 @@ var ZHR = (function () {
     }
   }
 
-  /* 在所有文档里找：可见 + 文案匹配白名单 + 不含危险词 的元素 */
+  /* 在所有文档里找：可见 + 文案匹配白名单 + 不含危险词 的元素
+     （用 textContent 而非 innerText，避免大页面遍历时反复触发重排） */
   function pilotFind(re, maxLen) {
     var docs = pilotDocs();
     for (var d = 0; d < docs.length; d++) {
       var qs;
       try { qs = docs[d].querySelectorAll('button,a,li,span,div,em,i,p,label,[role="button"]'); } catch (e) { continue; }
-      for (var i = 0; i < qs.length; i++) {
+      var n = Math.min(qs.length, 6000);
+      for (var i = 0; i < n; i++) {
         var el = qs[i];
         if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
         if (!pilotVisible(el)) continue;
-        var t = normWs(el.innerText || el.textContent || '');
+        var t = normWs(el.textContent || '');
         if (!t || t.length > (maxLen || 16)) continue;
         if (DANGER_RE.test(t)) continue;
         if (!re.test(t)) continue;
@@ -1043,22 +1045,31 @@ var ZHR = (function () {
     var hit = pilotFind(re, maxLen);
     if (!hit) return null;
     pilotFireClick(hit.el);
+    /* 同一按钮反复点但页面没进展 → 自动停，避免无效循环 */
+    if (PILOT.lastAction === hit.text) PILOT.sameAction = (PILOT.sameAction || 0) + 1;
+    else { PILOT.lastAction = hit.text; PILOT.sameAction = 1; }
+    if (PILOT.sameAction >= 8) pilotStop('同一按钮连续 8 次无效：' + hit.text);
     return hit.text;
   }
 
-  /* 无文字的图标按钮兔底：class/title/aria-label 含 close/exit/back/关闭/退出/返回 */
+  /* 无文字的图标按钮兔底：aria-label/title/class 里的词边界匹配 close/exit/back（不会被 background 误命中） */
   function pilotClickIcon(re) {
+    var wordRe = /(?:^|\s)(close|closed|exit|back|return|goback|cancel)(?:$|\s)/i;
     var docs = pilotDocs();
     for (var d = 0; d < docs.length; d++) {
       var els;
-      try { els = docs[d].querySelectorAll('[class*="close" i],[class*="exit" i],[class*="back" i],[aria-label],[title]'); } catch (e) { continue; }
-      for (var i = 0; i < els.length && i < 400; i++) {
+      try { els = docs[d].querySelectorAll('button,a,i,span,div,svg,img,[class],[aria-label],[title]'); } catch (e) { continue; }
+      var n = Math.min(els.length, 4000);
+      for (var i = 0; i < n; i++) {
         var el = els[i];
+        var tag = el.tagName;
+        if (tag !== 'BUTTON' && tag !== 'A' && tag !== 'I' && tag !== 'SPAN' && tag !== 'DIV' && tag !== 'SVG' && tag !== 'IMG') continue;
         if (el.closest && el.closest('#zhr-root,#zhr-scout-root')) continue;
         if (!pilotVisible(el)) continue;
-        var sig = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + clsOf(el);
-        if (!re.test(sig)) continue;
-        if (DANGER_RE.test(normWs(el.innerText || ''))) continue;
+        var aria = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '');
+        var sig = (aria + ' ' + clsOf(el)).replace(/[-_]/g, ' ');
+        if (!re.test(sig) && !wordRe.test(sig)) continue;
+        if (DANGER_RE.test(normWs(el.textContent || ''))) continue;
         pilotFireClick(el);
         return normWs(sig).slice(0, 24);
       }
@@ -1066,14 +1077,24 @@ var ZHR = (function () {
     return null;
   }
 
-  /* 只取“屏幕上可见”的题目容器（含同源 iframe）；隐藏的未展开解析不算 */
+  /* 只取“屏幕上可见、且解析出真正题目”的容器（含同源 iframe）；
+     空壳/标题/答题卡不算，避免在视频页被误当成“题目页” */
   function pilotContainers() {
     var docs = pilotDocs();
     var out = [];
     for (var d = 0; d < docs.length; d++) {
       var all = [];
       try { all = findQuestionContainers(docs[d]); } catch (e) { all = []; }
-      for (var i = 0; i < all.length; i++) if (pilotVisible(all[i])) out.push(all[i]);
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (!pilotVisible(el)) continue;
+        var p = null;
+        try { p = parseQuestion(el, ''); } catch (e2) { p = null; }
+        if (!p || !p.stem) continue;
+        if (looksLikeAnswerCard(el, p)) continue;
+        if (looksLikeNoise(el, p)) continue;
+        out.push(el);
+      }
     }
     return out;
   }
@@ -1122,6 +1143,8 @@ var ZHR = (function () {
         PILOT.emptyInThisVideo = false;
         PILOT.emptyRounds = 0;
         PILOT.idle = 0;
+        PILOT.lastAction = '';
+        PILOT.sameAction = 0;
         var nx = pilotClick(BTN_NEXT_RE, 16);
         if (nx) { pilotLog('→ 下一题（' + nx + '）'); return; }
       } else {
@@ -1173,6 +1196,8 @@ var ZHR = (function () {
     PILOT.emptyInThisVideo = false;
     PILOT.emptyRounds = 0;
     PILOT.catalogExhausted = false;
+    PILOT.lastAction = '';
+    PILOT.sameAction = 0;
     pilotLog('开始自动遍历（不答题、不提交）');
     var b = uiDoc().getElementById('zhr-b6');
     if (b) b.textContent = '⏹ 停止遍历';
