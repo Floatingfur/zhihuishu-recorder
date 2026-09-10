@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树课后题记录器 v1
 // @namespace    https://dsh.local/zhihuishu-recorder
-// @version      1.8.4
+// @version      1.8.5
 // @description  在你做完智慧树章节测验并进入「本次成绩/查看答案解析」页后，点「开始记录」把本章题目+正确答案存入本地题库（跨章节累计、按题干去重、选项乱序变体保留），可另存为 Word(.docx)。内置页面结构侦察/运行错误收集与「自动遍历」（仅自动打开解析并读取已展示内容，不答题、不提交）。纯本地运行，不联网。
 // @author       you
 // @match        https://*.zhihuishu.com/*
@@ -23,7 +23,7 @@
  */
 'use strict';
 var ZHR = (function () {
-  var VERSION = '1.8.4';
+  var VERSION = '1.8.5';
   /* ---------------- 运行期错误收集（供诊断报告展示） ---------------- */
   var ERRORS = [];
   function collectErr(ev) {
@@ -526,6 +526,45 @@ var ZHR = (function () {
 
   /* 宽松的选项字母匹配：字母可带括号/标点，后面可以有文字也可以没文字 */
   var OPT_SOFT_RE = /^[（(]?\s*([A-Ha-hＡ-Ｈａ-ｈ])\s*[)）.．、:：]?\s*(\S.*)?$/;
+
+  /* 判断一行是不是“选项开头”（比 OPT_SOFT_RE 多一道门槛）
+     关键：无标点时必须是大写字母（A teeth 算，breaking food…/discharging… 不算） */
+  function optSoftMatch(line) {
+    var L = String(line || '');
+    var m = L.match(OPT_SOFT_RE);
+    if (!m) return null;
+    var raw = m[1];
+    var rest = (m[2] || '').trim();
+    var hasSep = new RegExp('^[（(]?\\s*' + raw + '\\s*[)）.．、:：]').test(L);
+    if (!hasSep && rest && !/[A-HＡ-Ｈ]/.test(raw)) return null;   /* 小写开头的词（breaking…）不算选项 */
+    if (!hasSep && rest && rest.length > 60) return null;         /* 过长的一整句不当选项 */
+    return { letter: normLetter(raw).toUpperCase(), rest: rest };
+  }
+
+  /* 题干里混进了选项文字（真机常见：选项文字和题干挤在同一行）→ 从题干里摘掉 */
+  function stripOptionTexts(stem, options) {
+    var s = normWs(stem);
+    var opts = options || [];
+    if (!s || opts.length < 2) return s;
+    var texts = [], sumLen = 0;
+    for (var i = 0; i < opts.length; i++) {
+      var t = normWs(opts[i] && opts[i].text);
+      if (t.length < 2 || t.length > 60) return s;     /* 有异常选项 → 不动 */
+      if (s.indexOf(t) < 0) return s;                  /* 有选项文字不在题干里 → 不动 */
+      texts.push(t);
+      sumLen += t.length;
+    }
+    if (s.length - sumLen < 6) return s;               /* 摘掉后所剩太少 → 不动 */
+    var out = s;
+    for (var j = 0; j < texts.length; j++) {
+      var idx;
+      while ((idx = out.indexOf(texts[j])) >= 0) {          /* 全部出现都摘掉（可能不只一处） */
+        out = out.slice(0, idx) + ' ' + out.slice(idx + texts[j].length);
+      }
+    }
+    out = normWs(out).replace(/[，,、；;]\s*$/, '').trim();
+    return out.length >= 4 ? out : s;
+  }
   /* 状态行/自答行/解析/知识点：不进入题干/选项 */
   var STATUS_LINE_RE = /^(我的答案|您的答案|回答正确|回答错误|答对|答错|已作答|未作答|答案解析|解析|考查知识点|知识点)/;
   /* 下一题的题号行 */
@@ -556,6 +595,11 @@ var ZHR = (function () {
     return out;
   }
 
+  /* 字母与文字之间是否有分隔标点 */
+  function hitHasSep(line, rawLetter) {
+    return new RegExp('^[（(]?\\s*' + rawLetter + '\\s*[)）.．、:：]').test(String(line || ''));
+  }
+
   /* 宽松选项解析：兼容“字母单独一行 + 文字在下一行”“A 文字（无标点）”
      返回 {stem, options}；字母必须 A、B、C… 连续，否则不认（避免把题干误当选项） */
   function parseOptionsLoose(lines) {
@@ -566,11 +610,12 @@ var ZHR = (function () {
       if (STATUS_LINE_RE.test(L) || QNUM_LINE_RE.test(L)) continue;
       if (L.indexOf('（ ）') >= 0 || /\(\s*\)/.test(L)) continue;         /* 带空括号的多半是题干 */
       var m = L.match(OPT_SOFT_RE);
-      if (!m) continue;
-      var letter = normLetter(m[1]).toUpperCase();
-      var rest = (m[2] || '').trim();
+      var hit = m ? optSoftMatch(L) : null;
+      if (!m || !hit) continue;
+      var letter = hit.letter;
+      var rest = hit.rest;
       if (/[。．？?！!]$/.test(rest)) continue;                           /* 完整句子 → 当题干 */
-      var hasSep = new RegExp('^[（(]?\\s*' + m[1] + '\\s*[)）.．、:：]').test(L);
+      var hasSep = hitHasSep(L, m[1]);
       if (rest && !hasSep) weak.push({ i: i, letter: letter, rest: rest });
       else strong.push({ i: i, letter: letter, rest: rest });
     }
@@ -682,7 +727,9 @@ var ZHR = (function () {
     }
     lines = pairSplitOptions(lines);      /* 字母块 / 文字块 先配对好 */
     var stemLines = [], options = [], bareOpts = [], ansText = '', ansLineIdx = -1, pendingOpts = null;
+    var consumed = {};                     /* 已被当作“选项文字”用掉的行，不能再进题干 */
     for (var i = 0; i < lines.length; i++) {
+      if (consumed[i]) continue;
       var L = lines[i];
       if (ANSWER_LINE_RE.test(L)) {
         if (/我的答案|您的答案/.test(L) && !/正确答案|参考答案|标准答案/.test(L)) continue;
@@ -704,15 +751,21 @@ var ZHR = (function () {
         if (!otext && pendingOpts && options.length < pendingOpts.length) otext = pendingOpts[options.length];
         /* 字母行没文字 → 把随后的正文行当作这个选项的文字（智慧树常见：字母一行、文字下一行） */
         if (!otext) {
-          var buf = [];
+          var buf = [], usedIdx = [];
           for (var q2 = i + 1; q2 < lines.length; q2++) {
             var L4 = lines[q2];
-            if (OPT_RE.test(L4) || OPT_SOFT_RE.test(L4)) break;
+            /* 下一个选项开头（严格字母+标点 / 纯字母行）才断——
+               不能用宽泛的 OPT_SOFT_RE，否则 breaking…/discharging… 这类英文会被误当字母 */
+            if (OPT_RE.test(L4) || LETTER_ONLY_RE.test(L4) || optSoftMatch(L4)) break;
             if (ANSWER_LINE_RE.test(L4) || STATUS_LINE_RE.test(L4) || QNUM_LINE_RE.test(L4)) break;
             buf.push(L4);
+            usedIdx.push(q2);
             if (buf.join(' ').length > 120) break;
           }
-          if (buf.length) otext = cleanText(buf.join(' '));
+          if (buf.length) {
+            otext = cleanText(buf.join(' '));
+            for (var ui = 0; ui < usedIdx.length; ui++) consumed[usedIdx[ui]] = true;
+          }
         }
         options.push({ letter: letter, text: otext });
         continue;
@@ -730,7 +783,7 @@ var ZHR = (function () {
       try { loose = parseOptionsLoose(lines); } catch (eL) { loose = null; }
       if (loose && loose.options.length >= 2) {
         var looseStem = finalizeStem(loose.stem || stemLines.join(' '));
-        return { stem: looseStem || stem, options: loose.options, answerLine: ansText };
+        return { stem: stripOptionTexts(looseStem || stem, loose.options), options: loose.options, answerLine: ansText };
       }
     }
     /* 判断题：字母选项缺失时，用裸的对/错选项补上 */
@@ -739,7 +792,7 @@ var ZHR = (function () {
         options.push({ letter: String.fromCharCode(65 + j), text: bareOpts[j] });
       }
     }
-    return { stem: stem, options: options, answerLine: ansText };
+    return { stem: stripOptionTexts(stem, options), options: options, answerLine: ansText };
   }
 
   function typeOf(stem, options, radios, checks) {

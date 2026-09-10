@@ -178,5 +178,15 @@ ok('常规“A. 文字”不受预处理影响', () => {
   assert.strictEqual(o8.options.map(o => o.text).join('/'), '甲/乙/丙/丁');
 });
 
+const o9 = Z.parseLines('5. The term defecation refers to ______. taking food into the mouth breaking food into tiny nutrients nutrients entering blood vessels discharging solid food waste out of body\nA. taking food into the mouth\nB.\nbreaking food into tiny nutrients\nC. nutrients entering blood vessels\nD.\ndischarging solid food waste out of body\n答案：D');
+ok('字母行与文字行混排（文字以 b/d 开头）→ 不误判、四个选项全都读到', () => {
+  assert.strictEqual(o9.options.map(o => o.letter + '.' + o.text).join(' | '),
+    'A.taking food into the mouth | B.breaking food into tiny nutrients | C.nutrients entering blood vessels | D.discharging solid food waste out of body');
+});
+
+ok('题干行尾夹带的选项文字会被摘掉，题干只剩问题本身', () => {
+  assert.strictEqual(o9.stem, 'The term defecation refers to ______.');
+});
+
 console.log(passed + ' 项通过');
 if (process.exitCode) { console.error('存在失败用例'); }
